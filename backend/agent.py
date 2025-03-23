@@ -25,8 +25,8 @@ neo4j_uri = os.getenv('NEO4J_URI')
 neo4j_username = 'neo4j'
 neo4j_pass = os.getenv('NEO4J_PASS')
 driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_username, neo4j_pass))
-graph = Neo4jGraph(url=neo4j_uri, username=neo4j_username, password=neo4j_pass)
-
+graph = Neo4jGraph(url=neo4j_uri, username=neo4j_username, password=neo4j_pass, enhanced_schema=True)
+processed_components = None
 class cypher(BaseModel):
   problem: str = Field(description="problem to solve")
   cypher_script: str = Field(description="cypher script to run")
@@ -39,6 +39,19 @@ class GraphState(TypedDict):
 
 def parse_output(solution):
   return solution["parsed"]
+
+def run_cypher_query(query):
+  from neo4j.exceptions import CypherSyntaxError
+  if not query.endswith(';'):
+    query+=';'
+
+  
+  try:
+    driver.execute_query(query)
+  except CypherSyntaxError as e:
+    logger.warning(f'----CYPHER SYNTAX ERROR: {str(e)}----')
+    for query in query.split(';'):
+      driver.execute_query(query)
 
 def clean_exporter_file(file):
   new_lines = []
@@ -56,6 +69,7 @@ components = {label: set() for label in node_labels[:-1]}
 
 def parse_file(file):
   global components
+  global processed_components
   metric_pattern = re.compile(r'(\w+)\{([^}]*)\}\s+([\d\.]+)')
   data = None
   try:
@@ -85,8 +99,7 @@ def parse_file(file):
       if not assigned:
         metrics_component[node_labels[-1]].append(line)
 
-  components = {k: list(v) for k, v in components.items()}
-
+  processed_components={k: list(v) for k, v in components.items()}
 
 structured_llm = llm.with_structured_output(cypher, include_raw=True)
 
@@ -145,7 +158,13 @@ metrics_gen_chain = metrics_gen_prompt | structured_llm | parse_output
 #tried to use this prebuilt chain but it failed to return a valid response
 #for not i sticked to using a simple manual query on the db
 #TODO: REVISE THIS LATER FOR FUTURE IMPROVEMENTS
-neo4j_chain = GraphCypherQAChain.from_llm(llm, graph=graph, verbose=True, allow_dangerous_requests=True) 
+neo4j_chain = GraphCypherQAChain.from_llm(
+  llm,
+  graph=graph,
+  verbose=True,
+  allow_dangerous_requests=True,
+  function_response_system='Respond in a structured format with the question and the cypher query.',
+  validate_cypher=True) 
 
 
 ##################################### AGENT WORKFLOW ########################################
@@ -169,7 +188,7 @@ def cypher_validation(script):
 def existing_node(state: GraphState):
     global already_existing_node
     logger.info('----CHECKING EXISTING NODE----')
-    id = components['NODENAME'][0]
+    id = processed_components['NODENAME'][0]
     query=f'''MATCH (N:NODENAME) WHERE N.name='{id}' or N.id='{id}' RETURN COUNT(N)>0 as exists'''
     records, _, _=driver.execute_query(query)
     for record in records:
@@ -204,6 +223,77 @@ def component_gen(state: GraphState) -> GraphState:
 
   return {'generation':solution, "messages" : messages, "iterations" : iterations}
 
+def update_node(state:GraphState):
+  logger.info('----UPDATING NODES----')
+  messages = state['messages']
+  iterations = state['iterations']
+  update_statement=[]
+  system_name = processed_components['NODENAME'][0]
+  for label in node_labels[:-1]:
+    if label in metrics_component:
+      metrics =' '.join(metrics_component[label])
+      update_message= [
+          (
+              "user",
+              f'''
+                Generate CYPHER queries to update existing nodes with the correct properties based on the provided metrics.
+
+                INSTRUCTIONS:
+                1. First, match the system node using its name and save it with a WITH statement
+                2. Then match all nodes belonging to that system using the system property
+                3. Use the node's unique identifier (id or name) alongside the system property when matching specific nodes
+                4. Update node properties using the exact values from the metrics
+                5. If nodes or relationships are missing, create them before updating properties
+                6. Do not include any RETURN statements in the final queries
+
+                RULES FOR PROPERTY HANDLING:
+                - For each metric, parse all key-value pairs inside {{}} as separate properties
+                - Never use maps or JSON-like structures in Cypher queries
+                - Use the exact values provided without approximation or rounding
+                - For scientific notation (e.g., 3.1e+09), use the exact value as provided
+                
+                Use this syntax:
+                `
+                MATCH(n:NODENAME) WHERE n.name = '{system_name}'
+                WITH n
+                MATCH (c:{{component_label}} {{system: n, id: '{{component_id}}'}})
+                SET c.PROPERTY = VALUE
+                `
+                
+                First match all the nodes that are part of the system and then update their properties. Carry on the variables using WITH and UNWIND.
+                The system that needs to be updated is:
+                {system_name}
+                This is the current graph schema:
+                {graph.schema}
+                
+                These are the metrics that you need to process:
+                {metrics}
+              '''
+              )
+      ]
+      update = cypher_gen_chain.invoke({'messages':update_message})
+  
+      logger.info(f'----UPDATED NODES: {update.cypher_script}----')
+      update_statement.append(update.cypher_script)
+      if cypher_validation(update.cypher_script):
+        logger.info('----UPDATE VALIDATION: SUCCESS----')
+        run_cypher_query(update.cypher_script)
+      else:
+        logger.info('----UPDATE VALIDATION: FAILED----')
+      messages += [
+                (
+                    "assistant",
+                    f"CYPHER RELATIONSHIPS: \n Problem: {update.problem} \n CYPHER: \n {update.cypher_script}",
+                )
+        ]
+  # if cypher_validation(' '.join(update_statement)):
+  #   logger.info('----UPDATE VALIDATION: SUCCESS----')
+  #   run_cypher_query(update_statement)
+  # else:
+  #   logger.info('----UPDATE VALIDATION: FAILED----')
+  return {'generation':update,"messages" : messages, "iterations" : iterations}
+  
+
 def component_validation(state: GraphState):
   print('----VALIDATING COMPONENTS----')
   messages = state['messages']
@@ -232,7 +322,6 @@ def run_script(state: GraphState):
   try:
     driver.execute_query(cleaned_script)
   except CypherSyntaxError as e:
-    logger.warning(f'----CYPHER SYNTAX ERROR: {str(e)}----')
     for query in cleaned_script.split(';')[:-1]:
       driver.execute_query(query)
       
@@ -261,18 +350,31 @@ def generate_relationships(state: GraphState):
             name of the label using `_`.
 
             Only create relationships between existing nodes, do not create new nodes.
-            Use `FOREACH` to create the relationships for the nodes that were previously generated because
-            there may be multiples nodes with the same label that need to be connected.
-            Remember that WITH is required between FOREACH and MATCH.
+            First match all the nodes that are part of the system and then create the relationships. Carry on the variables using WITH and UNWIND.
+            Use this syntax to create relationships:
+            `MATCH (n:{{node_label}})
+            MATCH (c:{{component_1_label}} {{system: '{{system_identifier}}'}})
+            MATCH (s:{{component_2_label}} {{system: '{{system_identifier}}'}})
+            MATCH (d:{{component_3_label}} {{system: '{{system_identifier}}'}})
+            WITH n, COLLECT(c) AS cpus, COLLECT(s) AS sensors, COLLECT(d) AS disks
+            FOREACH (cpu IN cpus | MERGE (n)-[:{{relationship_1}}]->(cpu))
+            FOREACH (sensor IN sensors | MERGE (n)-[:{{relationship_2}}]->(sensor))
+            FOREACH (disk IN disks | MERGE (n)-[:{{relationship_3}}]->(disk));
+            `
             
             For context, the generated graph describes a computation unit that has different components.
             The relationships should start from the main node and have the following format: `HAS_*`.
+            The nodes that are part of a system should have a property `system` that represents the system it is part of. Use that to choose the nodes to connect.
+            For example, if the node with label `CPU` has a property `system: "edge2-System-Product-Name"`, then connect it to the NODENAME with that name.
+            The NODENAME node should not have a system property, but a name property that represents the name of the system. Use that to create the relationships.
+            
             These are the previously generated nodes:
             {nodes}
           '''
           )
   ]
   relationships = rel_gen_chain.invoke({'messages':rel_message})
+  logger.warning(f'----GENERATED RELATIONSHIPS: {relationships.cypher_script}----')
   messages += [
         (
             "assistant",
@@ -295,7 +397,7 @@ def generate_metrics(state:GraphState):
   error = state['error']
   
   for label in node_labels[:-1]:
-    if label == 'GPU':
+    if label=='GPU':
       continue
     if label in metrics_component:
       metrics =' '.join(metrics_component[label])
@@ -318,7 +420,7 @@ def generate_metrics(state:GraphState):
         For multiple nodes, generate separate queries, separated by `;`.
         After each `MATCH` clause, there should be an `;` to separate the queries.
         
-        For context, the  graph represents a computation unit with various hardware components.
+        For context, the  graph represents a computation unit with various hardware components. 
 
         Existing Nodes:
         {nodes_cypher}
@@ -344,13 +446,18 @@ def generate_metrics(state:GraphState):
   
   init_graph=True
   solution=cypher(problem='Metrics', cypher_script=' '.join(generated_metrics_script))
-  return {'generation':solution, "messages" : messages, "iterations" : iterations}  #TODO do not send the script as a string because the validator tries to take it out and crashes. 
+  return {'generation':solution, "messages" : messages, "iterations" : iterations} 
   
 def reflect(state: GraphState):
   pass
 
 def check_end(state: GraphState):
-  global init_graph
+  global init_graph, metrics_component, components
+  if init_graph:
+    for label in node_labels:
+      metrics_component[label].clear()
+    for label in node_labels[:-1]:
+      components[label].clear()  
   return init_graph
 
 def check_existing_node(state: GraphState):
@@ -372,10 +479,11 @@ def inititialize_graph():
     workflow.add_node('run_script_components', run_script)
     workflow.add_node('run_script_relationships', run_script)
     workflow.add_node('run_script_metrics', run_script)
+    workflow.add_node('update_node', update_node)
     
     workflow.add_edge(START, 'node_existance')
-    workflow.add_conditional_edges('node_existance', check_existing_node, {True: END, False: 'component_gen'}) # checks if the node already exists
-
+    workflow.add_conditional_edges('node_existance', check_existing_node, {True: 'update_node', False: 'component_gen'}) # checks if the node already exists
+    workflow.add_edge('update_node', END)
     workflow.add_edge('component_gen', 'validation_components')
     workflow.add_edge('validation_components', 'run_script_components')
     workflow.add_edge('run_script_components', 'relationship_gen')
@@ -410,9 +518,9 @@ def visualize_graph(app, output_file='graph.png'):
   else:
       print("Graph generation failed.")
 
-def start_agent():
-  parse_file('node_exporter_metrics.txt')
-  global components
+def start_agent(filename='node_exporter_metrics.txt'):
+  parse_file(filename)
+  global processed_components
   global metrics_component
   app = inititialize_graph()
   visualize_graph(app)
@@ -424,21 +532,32 @@ def start_agent():
       and the name of the variable is the label followed by `_` and its id or name. For example: `cpu_0`. \n
 
       Do not use special characters such as `-` in variable names.
-
-      {components}
+      
+      For context, the  graph represents a computation unit with various hardware components.
+      Because of that, I need you to add a property to each node that represents the system it is part of. For example, any node should have a property `system:"edge2-System-Product-Name"` where the value is the name of the system, represented by the node with label `NODENAME`.
+      For the `NODENAME` node, do not insert a system property.
+      
+      For every node include their name as a property. For example, the `CPU` node with id `0` should have a property `name: "0"`. 
+      
+      {processed_components}
       '''
       )
   ]
   )
-  messages = question.format_messages(components=components)
+  messages = question.format_messages(processed_components=processed_components)
   if not isinstance(messages , list):
       messages = [messages]
   solution = app.invoke({"messages":messages, "iterations":0, "error":""})
-  components={label: set() for label in node_labels[:-1]}
-  metrics_component= {label: [] for label in node_labels}
+  # components={label: set() for label in node_labels[:-1]}
+  # metrics_component= {label: [] for label in node_labels}
   return solution
 
+def query_graph(user_nl_query):
+  print(graph.schema)
+  return neo4j_chain.invoke({'query':user_nl_query})
+  
 
 #TODO implement the reflect system
 #TODO implement the update node and relationship system
-#TODO implement the metric processing system using the LLM and check if the metrics are valid
+#TODO move all global variables to a main function and start the execution from there
+#TODO chunk the metrics into smaller parts and process them in batches => the LLM has a token limit that could be reached
