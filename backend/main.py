@@ -32,12 +32,14 @@ async def root():
 
 @app.post("/upload")
 async def upload_metrics_file(file:UploadFile=File(...)):
-    file_location = os.path.join('.', file.filename)
-
+    dir = 'uploads'
+    if not os.path.exists(dir):
+        os.makedirs(dir)
+    file_location = os.path.join(dir, file.filename)
     try:
         with open(file_location, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-            AgentInterface().start_processing()
+            AgentInterface().start_processing(file_location)
         return {'message': f"File {file.filename} was uploaded successfully"}
     except Exception as e:
         return {'error':f"File {file.filename} failed: {str(e)}"} 
@@ -47,6 +49,11 @@ async def upload_metrics_file(file:UploadFile=File(...)):
 async def test_question(data:Message):
     solution = cypher_gen_chain.invoke({'messages':[('user', data.question)]})
     return solution
+
+@app.post("/query-graph")
+async def query_graph(query: Message):
+    return AgentInterface().query_graph(query.question)
+    
 
 @app.get('/get-current-graph')
 async def get_current_graph():
