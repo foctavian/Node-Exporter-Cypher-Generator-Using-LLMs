@@ -54,7 +54,7 @@
     }
 
     async function sendQuestion(){
-        axios.post("http://localhost:8000/agent-test", {
+        axios.post("http://localhost:8000/query-graph", {
             question: question
         },{headers: {
     "Content-Type": "application/json"

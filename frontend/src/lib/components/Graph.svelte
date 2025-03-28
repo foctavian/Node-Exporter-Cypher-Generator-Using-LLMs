@@ -3,10 +3,11 @@
     import { onMount } from "svelte";
     import { DataSet, Network } from "vis";
     import { writable } from "svelte/store";
-
+    
     let graphContainer;
     let selectedNode = writable(null);
-
+    let answer=writable('');
+    let question='';
     async function fetchGraph() {
         try {
             const response = await axios.get("http://localhost:8000/get-current-graph");
@@ -14,6 +15,18 @@
         } catch (error) {
             console.log(error);
         }
+    }
+
+    async function sendQuestion(){
+        axios.post("http://localhost:8000/query-graph", {
+            question: question
+        },{headers: {
+            "Content-Type": "application/json"
+        }}).then(response => {
+            answer=response.data.result;
+        }).catch(error => {
+            console.log(error);
+        });
     }
 
     function initializeVisGraph(graphData) {
@@ -84,18 +97,45 @@
 <style>
     #graph-container {
         width: 100%;
-        height: 400px;
+        display: flex;
+        height: 85vh;
         border: 1px solid #ddd;
+    }
+    .sidebar {
+        position: fixed;
+        right: 0;
+        top: 0;
+        height: 100vh;
+        width: 300px;
+        background: #f9f9f9;
+        border-left: 1px solid #ddd;
+        padding: 20px;
+        box-shadow: -2px 0 5px rgba(0, 0, 0, 0.1);
+        overflow-y: auto;
+        transition: transform 0.3s ease-in-out;
+    }
+
+    .hidden {
+        transform: translateX(100%);
+    }
+
+    h3 {
+        margin-top: 0;
     }
 </style>
 
 <div bind:this={graphContainer} id="graph-container"></div>
-
-<div>
-    <h3>{$selectedNode ? `Node ${$selectedNode.properties?.name || $selectedNode.id} : ${$selectedNode.group}` : "No node selected"}</h3>
+<div class="query-container">
+    <input type="text" 
+    bind:value={question} 
+    placeholder="Query the database" />
+    <button on:click={sendQuestion}>Send</button>
+    <br>
+    <h3>{answer}</h3>
+</div>
+<div class="sidebar {$selectedNode ? '' : 'hidden'}">
     {#if $selectedNode}
+        <h3>Node {$selectedNode.properties?.name || $selectedNode.id} : {$selectedNode.group}</h3>
         <pre>{JSON.stringify($selectedNode.properties, null, 2)}</pre>
-    {:else}
-        <p>Click on a node to see details.</p>
     {/if}
 </div>
