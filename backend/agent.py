@@ -10,7 +10,7 @@ from langgraph.types import Command
 from typing import Literal
 import re 
 from typing import List, Optional
-from typing_extensions import TypedDict
+from typing_extensions import TypedDict, NotRequired
 from langchain_neo4j import GraphCypherQAChain, Neo4jGraph
 import logging
 from PIL import Image
@@ -47,7 +47,8 @@ class GraphState(TypedDict):
   generation: str
   iterations : int
   script: SystemCypherScript
-
+  traceback: bool = False
+  
 def parse_output(solution):
   return solution["parsed"]
 
@@ -118,6 +119,7 @@ def parse_file(file):
 
 structured_llm = llm.with_structured_output(cypher, include_raw=True)
 
+
 cypher_gen_prompt = ChatPromptTemplate(
     [
         (
@@ -164,11 +166,46 @@ metrics_gen_prompt= ChatPromptTemplate(
   ]
 )
 
+reflections_prompts= ChatPromptTemplate(
+  [
+    (
+      'system',
+      '''
+      You are an assistant with expertise in Cypher scripts and Node exporter metrics.\n
+      You will be tasked with reflecting on the error that occured during the generation of a cypher script.\n
+      
+      For context, the script should be part of a graph that represents a computation unit with various hardware components.\n 
+      The script may be generating nodes, relationships or properties.\n
+      You will be provided with the error message and the script that caused the error.\n
+      '''
+    ),
+    ('user', '{messages}')
+  ]
+)
+
+node_inferring_prompts = ChatPromptTemplate(
+  [
+    ('system',
+     '''
+     You are an assistant with expertise in Node Exporter metrics.\n
+      You will be tasked with inferring the missing nodes from the metrics provided.\n
+      
+      For context, the script should be part of a graph that represents a computation unit with various hardware components.\n
+     '''
+     ),
+    ('user', '{messages}')
+  ]
+)
+
 cypher_gen_chain = cypher_gen_prompt | structured_llm | parse_output
 
 rel_gen_chain = relationship_gen_prompt | structured_llm | parse_output
 
 metrics_gen_chain = metrics_gen_prompt | structured_llm | parse_output
+
+reflections_chain = reflections_prompts | structured_llm | parse_output
+
+node_inferring_chain = node_inferring_prompts | llm 
 
 #tried to use this prebuilt chain but it failed to return a valid response
 #for not i sticked to using a simple manual query on the db
@@ -211,6 +248,14 @@ def cypher_validation(script):
 def split_query_on_semicolon(query:str):
   return query.split(';')
 
+def chunk_file(file):
+  from langchain_text_splitters import CharacterTextSplitter
+  with open(file, 'r') as f:
+    lines = f.read() 
+    text_splitter = CharacterTextSplitter.from_tiktoken_encoder(encoding_name="cl100k_base", chunk_size=10000, chunk_overlap=200)
+    texts = text_splitter.split_text(lines)
+    print(texts[0])
+  
 
 ##################################### AGENT WORKFLOW ########################################
 max_iterations = 5
@@ -230,15 +275,13 @@ def cypher_check(state: GraphState):
   properties = solution['properties']
   
   error = 'no'
-  #TODO switch from running queries after every generation to running only the final output
-
   #first validate the node script
   valid_node, msg_node = cypher_validation(nodes)
   if not valid_node: # node script is invalid
     logger.warning(f'----NODE SCRIPT VALIDATION: FAILED : {msg_node}----')
     error_message = [("user", f"Node script is invalid: {msg_node}")]
     messages += error_message
-    return {'error':'yes:nodes', 'messages':messages, 'iterations':state['iterations'], 'script':solution}
+    return {'error':f'yes:nodes:{msg_node}', 'messages':messages, 'iterations':state['iterations'], 'script':solution, 'traceback':True}
   else:
     logger.info(f'----NODE SCRIPT VALIDATION: SUCCESS----')
 
@@ -248,30 +291,46 @@ def cypher_check(state: GraphState):
     logger.warning(f'----RELATIONSHIP SCRIPT VALIDATION: FAILED : {msg_rel}----')
     error_message = [("user", f"Relationship script is invalid: {msg_rel}")]
     messages += error_message
-    return {'error':'yes:relationships', 'messages':messages, 'iterations':state['iterations'], 'script':solution}
+    return {'error':f'yes:relationships:{msg_rel}', 'messages':messages, 'iterations':state['iterations'], 'script':solution, 'traceback':True}
   else:
     logger.info(f'----RELATIONSHIP SCRIPT VALIDATION: SUCCESS----')
     
   # then validate the properties script
   property_list_query = split_query_on_semicolon(properties) # the query needs to be split to be checked individually
-  for q in property_list_query[:-1]: 
-    valid_prop, msg_prop = cypher_validation(q)
-    if not valid_prop: # properties script is invalid
-      logger.warning(f'----PROPERTIES SCRIPT VALIDATION: FAILED : {msg_prop}----')
-      error_message = [("user", f"Properties script is invalid: {msg_prop}")]
-      messages += error_message
-      return {'error':'yes:properties', 'messages':messages, 'iterations':state['iterations'], 'script':solution}
-    
+  wrong_queries = []
+  # for q  in property_list_query[:-1]:  
+  #   valid_prop, msg_prop = cypher_validation(property_list_query)
+  #   if not valid_prop:
+      #wrong_queries.append(q)
+      #logger.warning(f'----PROPERTIES SCRIPT VALIDATION: FAILED----')
+      #error_message = [("user", f"Properties script is invalid: {msg_prop}")]
+      #messages += error_message
+      #return {'error':f'yes:properties:{msg_prop}', 'messages':messages, 'iterations':state['iterations'], 'script':solution, 'traceback':True}
+  
   logger.info(f'----PROPERTIES SCRIPT VALIDATION: SUCCESS----')
-    
   logger.info('----CYPHER SCRIPTS VALIDATION: SUCCESS----')
   logger.info('----RUNNING SCRIPT----')
   run_cypher_query(nodes)
   run_cypher_query(relationships)
-  run_cypher_query(properties)
+  for q in property_list_query:
+    try:
+      if q == '': continue
+      run_cypher_query(q)
+    except Exception:
+      wrong_queries.append(q)
+  logger.warning(f"---WRONG QUERIES: {wrong_queries}")    
   init_graph = True
-  return {'error':'no', 'messages':messages, 'iterations':state['iterations'], 'script':solution}
-    
+  if len(wrong_queries) == 0:
+    return {'error':'no', 'messages':messages, 'iterations':state['iterations'], 'script':solution, 'traceback':False}
+  else:
+    return {'error':f'yes:properties:{wrong_queries}', 'messages':messages, 'iterations':state['iterations'], 'script':solution, 'traceback':True}
+
+def traceback_from_reflect(state: GraphState):
+  error = state['error']
+  # if 'yes' in error:
+  #   _, err_cause, _ = error.split(':', 2)
+  #   return err_cause 
+  return 'check'
   
 def existing_node(state: GraphState):
     global already_existing_node
@@ -294,6 +353,7 @@ def node_gen(state: GraphState) -> GraphState:
   iterations = state['iterations']
   error = state['error']
   script = state['script']
+  traceback = state['traceback']
   
   if error == 'yes':
     messages += [
@@ -312,9 +372,25 @@ def node_gen(state: GraphState) -> GraphState:
   
   script['nodes'] = solution.cypher_script
   logger.info(f'----GENERATED NODES: {solution.cypher_script}----')
-  return {'generation':solution, "messages" : messages, "iterations" : iterations, "script": script}
+  return {'generation':solution, "messages" : messages, "iterations" : iterations, "script": script, 'traceback':traceback}
 
-def update_node(state:GraphState): #TODO refactor this
+def infer_missing_nodes(state: GraphState):
+  logger.info('----INFERRING MISSING NODES----')
+  
+  logger.info(f'{graph.schema}') # based on this schema we can infer the missing nodes
+  
+  messages = state['messages']
+  iterations = state['iterations']
+  error = state['error']
+  script = state['script']
+  
+  # chunk the file
+   
+
+def generate_update_script(state: GraphState):
+  pass
+
+def update_node(state:GraphState): #TODO refactor this => split into multiple nodes : infer, generate
   logger.info('----UPDATING NODES----')
   messages = state['messages']
   iterations = state['iterations']
@@ -445,7 +521,7 @@ def relationships_gen(state: GraphState):
   iterations = state['iterations']
   error = state['error']
   script = state['script']
-
+  traceback = state['traceback']
   nodes = state['generation'].cypher_script
   nodes_cypher= ''.join(nodes)
   rel_message= [
@@ -494,9 +570,9 @@ def relationships_gen(state: GraphState):
   script['relationships'] = relationships.cypher_script
   logger.info(f'----GENERATED RELATIONSHIPS: {relationships.cypher_script}----')
   #print("Generated relationships:", relationships)
-  return {'generation':relationships,"messages" : messages, "iterations" : iterations, "script":script}
+  return {'generation':relationships,"messages" : messages, "iterations" : iterations, "script":script, 'traceback':traceback}
 
-def metrics_gen(state:GraphState): #TODO: refactor this code to be more modular
+def metrics_gen(state:GraphState): #TODO: refactor this code to be more modular ; also change name to be more specific
   global nodes_cypher
   global iterations
   global init_graph
@@ -507,6 +583,31 @@ def metrics_gen(state:GraphState): #TODO: refactor this code to be more modular
   iterations = state['iterations']
   error = state['error']
   script = state['script']
+  traceback = state['traceback']
+  
+  
+  if 'yes' in error:
+    _, _, err_msg = error.split(':', 2)
+    logger.info('----METRICS RETRYING GENERATION----')
+    messages += [
+        (
+                "user",
+                f'''Now, try again. Fix this error: {err_msg}. \n
+                Provide the whole query with the error fixed. \n
+                ''',
+            )
+    ]
+    
+    regenerated_metrics = metrics_gen_chain.invoke({
+        "messages":messages
+    })
+    script['properties'] = regenerated_metrics.cypher_script
+    logger.info(f'----REGENERATED METRICS: {regenerated_metrics.cypher_script}----')
+    messages += [
+        ('assistant', f"METRICS: {regenerated_metrics}")
+    ]
+    init_graph=True
+    return {'generation':regenerated_metrics, "messages" : messages, "iterations" : iterations, "script":script, 'traceback':traceback} 
   
   for label in node_labels[:-1]:
     if label=='GPU':
@@ -514,7 +615,7 @@ def metrics_gen(state:GraphState): #TODO: refactor this code to be more modular
     if label in metrics_component:
       metrics =' '.join(metrics_component[label])
       logger.warning(f'METRICS: {label} SIZE {len(metrics)}')
-      if len(metrics) > 25000:
+      if len(metrics) > 20000:
         chunks = chunk_metrics(metrics)
         for chunk in chunks:
           metrics_message=[
@@ -525,16 +626,19 @@ def metrics_gen(state:GraphState): #TODO: refactor this code to be more modular
 
             The metrics should be added as properties of the appropriate nodes that are already created in the graph.
             Use the following syntax to update node properties:
-              `MATCH (n:LABEL {{id: VALUE}}) SET n.PROPERTY = METRIC_VALUE`
+              `MATCH (n:LABEL {{id: VALUE}} {{n.system=`system_name`}}) SET n.PROPERTY = METRIC_VALUE`
             Example: Given the metric node_cpu_frequency_max_hertz{{cpu="0"}} 3.1e+09, update the node with label CPU and id: "0" by setting max_hertz = 3.1e+09.
             Each key-value pair inside {{}} must be set as an individual property. Do not treat them as a single map.
             If a metric has multiple attributes (e.g., node_network_info{{address="02:42:db:56:1c:74", adminstate="up"}}), split them into separate properties like
-              `MATCH (n:Network) SET n.address = "02:42:db:56:1c:74", n.adminstate = "up"`    
-            Never use maps or JSON-like structures in Cypher queries. Each attribute should be a separate property.
-            Do not approximate values, use the exact values provided.
-            Batch updates: Set all properties in a single query per node, using multiple SET clauses when updating multiple properties at once.
-            Do not separate queries by `;`.
-            For context, the  graph represents a computation unit with various hardware components. 
+              `MATCH (n:Network {{n.system=`system_name`}}) SET n.address = "02:42:db:56:1c:74", n.adminstate = "up"`    
+            **Rules to follow:**
+            - Never use maps or JSON-like structures in Cypher queries. Each attribute must be a separate property.
+            - **Do not use `WITH` or `UNWIND` statements.**
+            - **Ensure every `MATCH` query ends with `;`** before generating the next one.
+            - **Batch updates:** If multiple properties are set for the same node, use a **single `MATCH` statement** and multiple `SET` clauses.
+            - Do not approximate values—use the exact values provided.
+            - Never return anything; no `RETURN` statements.
+            - Use the name or id of the NODENAME node to match the correct nodes. Every node has a property that represents the system it's part of.
 
             Existing Nodes:
             {nodes_cypher}
@@ -557,16 +661,18 @@ def metrics_gen(state:GraphState): #TODO: refactor this code to be more modular
 
           The metrics should be added as properties of the appropriate nodes that are already created in the graph.
           Use the following syntax to update node properties:
-            `MATCH (n:LABEL {{id: VALUE}}) SET n.PROPERTY = METRIC_VALUE`
+            `MATCH (n:LABEL {{id: VALUE}} {{n.system=`system_name`}}) SET n.PROPERTY = METRIC_VALUE`
           Example: Given the metric node_cpu_frequency_max_hertz{{cpu="0"}} 3.1e+09, update the node with label CPU and id: "0" by setting max_hertz = 3.1e+09.
           Each key-value pair inside {{}} must be set as an individual property. Do not treat them as a single map.
           If a metric has multiple attributes (e.g., node_network_info{{address="02:42:db:56:1c:74", adminstate="up"}}), split them into separate properties like
-            `MATCH (n:Network) SET n.address = "02:42:db:56:1c:74", n.adminstate = "up"`    
-          Never use maps or JSON-like structures in Cypher queries. Each attribute should be a separate property.
-          Do not approximate values, use the exact values provided.
-          Batch updates: Set all properties in a single query per node, using multiple SET clauses when updating multiple properties at once.
-          For multiple nodes, generate separate queries, separated by `;`.
-          After each `MATCH` clause, there should be an `;` to separate the queries.
+            `MATCH (n:Network {{n.system=`system_name`}}) SET n.address = "02:42:db:56:1c:74", n.adminstate = "up"`    
+           **Rules to follow:**
+            - Never use maps or JSON-like structures in Cypher queries. Each attribute must be a separate property.
+            - **Do not use `WITH` or `UNWIND` statements.**
+            - **Ensure every `MATCH` query ends with `;`** before generating the next one.
+            - **Batch updates:** If multiple properties are set for the same node, use a **single `MATCH` statement** and multiple `SET` clauses.
+            - Do not approximate values—use the exact values provided.
+            - Never return anything; no `RETURN` statements.
           
           For context, the  graph represents a computation unit with various hardware components. 
 
@@ -591,35 +697,62 @@ def metrics_gen(state:GraphState): #TODO: refactor this code to be more modular
     ]
   
   script['properties'] = " ".join(generated_metrics_script)
-  
-  logger.warning(f'----GENERATED METRICS: {' '.join(generated_metrics_script)}----')
-  
+    
   init_graph=True
   solution=cypher(problem='Metrics', cypher_script=' '.join(generated_metrics_script))
-  return {'generation':solution, "messages" : messages, "iterations" : iterations} 
+  return {'generation':solution, "messages" : messages, "iterations" : iterations, "script":script, 'traceback':traceback} 
   
-def reflect(state: GraphState):
+def reflect(state: GraphState): #TODO might need to be refactored; the if statement is not needed
   messages = state['messages']
   iterations = state['iterations']
   error = state['error']
   solution = state['generation']
+  traceback = state['traceback']
+  script = state['script']
+  logger.info(f"----ENTERED REFLECT: {'yes' in error}----")
+  if 'yes' in error:
+    _, err_cause, err_msg = error.split(':', 2)# too many values to unpack => the error contains some more ':'
+    logger.info('----REFLECTING ON ERROR----')
+    messages += [
+        (
+                "user",
+                f"""Reflect on the error that occured during {err_cause} generation: {err_msg}\n 
+                Provide the fixed cypher script with the error fixed. \n
+                """,
+            )
+    ]
+    solution = reflections_chain.invoke({
+        "messages":messages
+    })
+    messages += [
+        ('assistant', f"These are the reflections: {solution}")
+    ]
+    traceback=True
+    logger.warning(f'----REFLECTIONS: {solution}----')
+    if solution:
+      script['properties'] = solution.cypher_script
+    return {'error':error, 'messages':messages, 'iterations':iterations, 'generation':solution, 'script':script, 'traceback':traceback}
+
+def check_traceback_reflect_error(state: GraphState):
+  return state['traceback']
 
 def check_end(state: GraphState):
   global init_graph, metrics_component, components
   error = state['error']
-  
-  if init_graph:
+  logger.warning(f'----CHECKING END OF WORKFLOW: {error}----')
+  if init_graph and 'yes' not in error:
+    logger.info('----END OF WORKFLOW----')
+    logger.info('----WORKFLOW SUCCESSFULLY COMPLETED----')
+    # clean the components and metrics
     for label in node_labels:
       metrics_component[label].clear()
     for label in node_labels[:-1]:
       components[label].clear()  
     return 'end'
-  else:
-    err, err_cause = error.split(':')
-    if err == 'yes':
-      return err_cause
-    else: return 'reflect'
-    
+  elif 'yes' in error:
+    logger.info('----WORKFLOW FAILED: REDIRECTING TO REFLECT----')
+    return 'reflect'
+
 
 def check_existing_node(state: GraphState):
     global already_existing_node
@@ -633,30 +766,39 @@ def inititialize_graph():
     workflow.add_node('relationship_gen', relationships_gen)
     workflow.add_node('metrics_gen', metrics_gen)
     workflow.add_node('cypher_check', cypher_check)
-    workflow.add_node('update_node', update_node)
+    #workflow.add_node('update_node', update_node)
+    workflow.add_node('infer', infer_missing_nodes)
+    workflow.add_node('update', generate_update_script) 
     workflow.add_node('reflect', reflect)
     
     workflow.add_edge(START, 'node_existance')
-    workflow.add_conditional_edges('node_existance', check_existing_node, {True: 'update_node', False: 'node_gen'}) # checks if the node already exists
-    workflow.add_edge('update_node', END)
-    workflow.add_edge('node_gen', 'relationship_gen')
-    workflow.add_edge('relationship_gen', 'metrics_gen')
+    workflow.add_conditional_edges('node_existance', check_existing_node, {True: 'infer', False: 'node_gen'}) # checks if the node already exists
     workflow.add_edge('metrics_gen', 'cypher_check')
     
+    workflow.add_edge('infer', 'update')
+    workflow.add_edge('update', END)
+    workflow.add_conditional_edges('node_gen' ,check_traceback_reflect_error, {True: 'cypher_check', False: 'relationship_gen'})
+    workflow.add_conditional_edges('relationship_gen', check_traceback_reflect_error, {True: 'cypher_check', False: 'metrics_gen'})    
+
     workflow.add_conditional_edges(
       "cypher_check",
       check_end,
       {
         "end": END,
-        "reflect": "reflect",
-        "node": "node_gen",
-        "relationship": "relationship_gen",
-        "metrics": "metrics_gen"
+        "reflect": 'reflect',
       }
     )
-    workflow.add_edge('reflect', 'node_gen')
-    workflow.add_edge('reflect', 'relationship_gen')
-    workflow.add_edge('reflect', 'metrics_gen')
+    
+    workflow.add_conditional_edges(
+      'reflect',
+      traceback_from_reflect,
+      {
+        'check': 'cypher_check',
+        # 'node': 'node_gen',
+        # 'relationship': 'relationship_gen',
+        # 'properties': 'metrics_gen'
+      }
+    )
 
     app = workflow.compile()
     return app
@@ -685,7 +827,7 @@ def start_agent(filename='node_exporter_metrics.txt'):
   global processed_components
   global metrics_component
   app = inititialize_graph()
-  visualize_graph(app)
+  #visualize_graph(app)
   logger.info('----STARTING AGENT----')
   question = ChatPromptTemplate([
       ('user',
@@ -710,7 +852,7 @@ def start_agent(filename='node_exporter_metrics.txt'):
   if not isinstance(messages , list):
       messages = [messages]
   empty_script = SystemCypherScript()
-  solution = app.invoke({"messages":messages, "iterations":0, "error":"", 'script':empty_script})
+  solution = app.invoke({"messages":messages, "iterations":0, "error":"", 'script':empty_script, 'traceback':False})
   # components={label: set() for label in node_labels[:-1]}
   # metrics_component= {label: [] for label in node_labels}
   return solution
@@ -720,8 +862,7 @@ def query_graph(user_nl_query):
   return neo4j_chain.invoke({'query':user_nl_query})
   
 
-#TODO implement the reflect system
 #TODO implement the update node and relationship system
 #TODO move all global variables to a main function and start the execution from there
-#TODO after reflection, the agent should be able to return to the checker instead of regenerating the entire graph
 #TODO change the update-node => split into two nodes, one to infer new components and  one that updates the properties of the existing nodes
+#TODO move all the prompt blocks to another file 
