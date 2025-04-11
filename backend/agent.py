@@ -21,6 +21,7 @@ from dataclasses import dataclass
 logger = logging.getLogger(__name__)
 logging.basicConfig(filename='logs.log', level=logging.INFO)
 
+############################## GLOBAL VARIABLES ############################
 load_dotenv()
 tokenizer = MistralTokenizer.v3()
 mistral_model = "codestral-latest"
@@ -40,6 +41,25 @@ class SystemCypherScript(TypedDict): # this class is used to store the cypher sc
   nodes: str=""
   relationships: str=""
   properties: str=""
+  
+@dataclass(frozen=True)
+class Node(BaseModel):
+  name: str = Field(description="name or id of the node")
+  label: str = Field(description="label of the node, e.g. CPU, GPU, etc.")
+
+@dataclass(frozen=True)
+class Relationship(BaseModel):
+  source: str = Field(description="name or id of the source node")
+  target: str = Field(description="name or id of the target node")
+  relationship: str = Field(description="relationship between the nodes")
+
+class InferredNodes(BaseModel):
+  problem: str = Field(description="problem to solve")
+  nodes: List[Node] = Field(description="list of nodes to create")
+
+class InferredRelationships(BaseModel):
+  problem: str = Field(description="problem to solve")
+  relationships: List[Relationship] = Field(description="list of relationships to create")
 
 class GraphState(TypedDict):
   error : str
@@ -66,8 +86,6 @@ def run_cypher_query(query):
     for q in query.split(';'):
       driver.execute_query(q)
     logger.warning(f'----CYPHER SYNTAX ERROR: {str(e)}----')
-  
-  
 
 def clean_exporter_file(file):
   new_lines = []
@@ -82,14 +100,18 @@ def clean_exporter_file(file):
 node_labels = ["CPU", 'GPU', 'SENSOR', 'NODENAME', 'FILESYSTEM','NETWORK','POWER_SUPPLY','DISK', 'PROPERTY']
 metrics_component = {label: [] for label in node_labels}
 components = {label: set() for label in node_labels[:-1]}
+file_text = None
 
 def parse_file(file):
   global components
   global processed_components
+  global file_text
+  
   metric_pattern = re.compile(r'(\w+)\{([^}]*)\}\s+([\d\.]+)')
   data = None
   try:
       data=clean_exporter_file(file).split('\n')
+      file_text = clean_exporter_file(file) #TODO move this to another function; for now it works -> using it in the infer nodes function 
       logger.info("File parsed successfully")
   except FileNotFoundError:
       logger.error("File not found")
@@ -118,7 +140,8 @@ def parse_file(file):
   processed_components={k: list(v) for k, v in components.items()}
 
 structured_llm = llm.with_structured_output(cypher, include_raw=True)
-
+structured_node_inferring_llm= llm.with_structured_output(InferredNodes, include_raw=True)
+structured_rel_inferring_llm = llm.with_structured_output(InferredRelationships, include_raw=True)
 
 cypher_gen_prompt = ChatPromptTemplate(
     [
@@ -197,6 +220,21 @@ node_inferring_prompts = ChatPromptTemplate(
   ]
 )
 
+relationship_inferring_prompts = ChatPromptTemplate(
+  [
+    ('system',
+     '''
+     You are an assistant with expertise in Node Exporter metrics.\n
+      You will be tasked with inferring the relationships between from the metrics provided.\n
+      
+      For context, the script should be part of a graph that represents a computation unit with various hardware components.\n
+     '''
+     ),
+    ('user', '{messages}')
+  ]
+)
+
+
 cypher_gen_chain = cypher_gen_prompt | structured_llm | parse_output
 
 rel_gen_chain = relationship_gen_prompt | structured_llm | parse_output
@@ -205,7 +243,9 @@ metrics_gen_chain = metrics_gen_prompt | structured_llm | parse_output
 
 reflections_chain = reflections_prompts | structured_llm | parse_output
 
-node_inferring_chain = node_inferring_prompts | llm 
+node_inferring_chain = node_inferring_prompts | structured_node_inferring_llm | parse_output 
+
+relationships_inferring_chain = relationship_inferring_prompts | structured_rel_inferring_llm | parse_output
 
 #tried to use this prebuilt chain but it failed to return a valid response
 #for not i sticked to using a simple manual query on the db
@@ -227,7 +267,7 @@ def token_threshold_check(msg:str):
 def chunk_metrics(metrics:str):
   from langchain_text_splitters import RecursiveCharacterTextSplitter
   text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=10000,
+    chunk_size=8000,
     chunk_overlap=200,
     length_function=len,
     is_separator_regex=False,
@@ -248,13 +288,11 @@ def cypher_validation(script):
 def split_query_on_semicolon(query:str):
   return query.split(';')
 
-def chunk_file(file):
-  from langchain_text_splitters import CharacterTextSplitter
-  with open(file, 'r') as f:
-    lines = f.read() 
-    text_splitter = CharacterTextSplitter.from_tiktoken_encoder(encoding_name="cl100k_base", chunk_size=10000, chunk_overlap=200)
-    texts = text_splitter.split_text(lines)
-    print(texts[0])
+def chunk_file(text):
+  from langchain_text_splitters import CharacterTextSplitter 
+  text_splitter = CharacterTextSplitter.from_tiktoken_encoder(encoding_name="cl100k_base", chunk_size=10000, chunk_overlap=200)
+  texts = text_splitter.split_text(text)
+  print(texts[0])
   
 
 ##################################### AGENT WORKFLOW ########################################
@@ -273,8 +311,7 @@ def cypher_check(state: GraphState):
   nodes = solution['nodes']
   relationships = solution['relationships']
   properties = solution['properties']
-  
-  error = 'no'
+
   #first validate the node script
   valid_node, msg_node = cypher_validation(nodes)
   if not valid_node: # node script is invalid
@@ -375,19 +412,148 @@ def node_gen(state: GraphState) -> GraphState:
   return {'generation':solution, "messages" : messages, "iterations" : iterations, "script": script, 'traceback':traceback}
 
 def infer_missing_nodes(state: GraphState):
+  import time
+  global file_text
   logger.info('----INFERRING MISSING NODES----')
   
   logger.info(f'{graph.schema}') # based on this schema we can infer the missing nodes
   
-  messages = state['messages']
-  iterations = state['iterations']
-  error = state['error']
-  script = state['script']
-  
   # chunk the file
-   
+  chunks =  chunk_metrics(file_text)
+  missing_nodes = []
+  for chunk in chunks :
+    time.sleep(1.5)
+    # use the chunk to infer the missing nodes
+    messages = [
+        (
+            "user",
+            f'''
+            Extract only the name and type of nodes from the metrics. Use the provided schema to determine existing nodes.
+            If you encounter a node that is not present in the schema, infer its name and type.
+            As a rule of thumb, if the type represents a physical components, you can take it into consideration. 
+            Do not abbreviate the name of the label. 
+            Return **only** the nodes that are **not present** in the schema.
+            There could be some false positives, so be careful when inferring the nodes. The schema has CPU nodes so a PROCESSOR node is not needed.
+            
+            Steps:
+            1. Parse `{chunk}` to extract node names and types.
+            2. Compare these against the provided schema (`{graph.schema}`).
+            3. Return a **list of missing nodes**. If all nodes exist, return an **empty list**.
 
-def generate_update_script(state: GraphState):
+            Ensure that nodes are compared strictly by both **name** and **type** before determining if they are missing.
+            '''
+        )
+    ]
+    solution = node_inferring_chain.invoke({
+        "messages":messages
+    })
+    if not solution:
+      logger.info('----NO MISSING NODES----')
+      messages += [
+          ('assistant', 'NO MISSING NODES')
+      ]
+    else:
+      logger.info(f'----INFERRED NODES: {solution.nodes}----')
+      messages += [
+          ('assistant', f"INFERRED NODES: {solution.nodes}")
+      ]
+      missing_nodes += solution.nodes
+  
+  # remove the duplicates or the false positives
+  unique_nodes = list(set(missing_nodes))
+  from collections import defaultdict
+  label_to_nodes = defaultdict(list)
+
+  for node in unique_nodes:
+    label_to_nodes[node.label].append(node.name)
+  question = ChatPromptTemplate([
+      ('user',
+      f'''
+      Convert these components into CYPHER nodes. Make it so each label is the key of the dictionary \n
+      and the name of the variable is the label followed by `_` and its id or name. For example: `cpu_0`. \n
+
+      Do not use special characters such as `-` in variable names.
+      
+      For context, the  graph represents a computation unit with various hardware components.
+      Because of that, I need you to add a property to each node that represents the system it is part of. The NODENAME is {processed_components['NODENAME'][0]}.
+      For the `NODENAME` node, do not insert a system property.
+      Do not return any values in the final query.
+      For every node include their name as a property. For example, the `CPU` node with id `0` should have a property `name: "0"`. 
+      
+      Use the MERGE instead of CREATE.
+
+      {label_to_nodes}
+      '''
+      )
+  ]
+  )
+  messages += question  
+  return {"messages": messages,**state}
+ 
+def infer_missing_relationships(state: GraphState):
+  import time
+  logger.info('----INFERRING MISSING RELATIONSHIPS----')
+  global file_text
+  missing_relationships = []
+  chunks = chunk_metrics(file_text)
+  for chunk in chunks :
+    time.sleep(1.5)
+    # use the chunk to infer the missing nodes
+    messages = [
+        (
+            "user",
+            f'''
+            Infer the relationships between the nodes based on the provided metrics. Use the provided schema to determine existing relationships.
+            These are the nodes that were previously inferred: 
+            {state['script']['nodes']}
+            Steps:
+            1. Parse `{chunk}` to extract relationship names and types.
+            2. Compare these against the provided schema (`{graph.schema}`).
+            3. Return a **list of missing relationships**. If all relationships exist, return an **empty list**.
+
+            Ensure that relationships are compared strictly by both **name** and **type** before determining if they are missing.
+            '''
+        )
+    ]
+    solution = relationships_inferring_chain.invoke({
+        "messages":messages
+    })
+    if not solution:
+      logger.info('----NO MISSING RELATIONSHIPS----')
+      messages += [
+          ('assistant', 'NO MISSING RELATIONSHIPS')
+      ]
+    else:
+      logger.info(f'----INFERRED RELATIONSHIPS: {solution.relationships}----')
+      messages += [
+          ('assistant', f"INFERRED RELATIONSHIPS: {solution.relationships}")
+      ]
+      missing_relationships += solution.relationships
+  return {**state}
+  
+
+def generate_node_update_script(state:GraphState): # TODO route this to the existing node generation node
+  messages = state['messages']
+  
+  solution = cypher_gen_chain.invoke({
+      "messages":messages
+  })
+  
+  logger.info(f'----GENERATED UPDATED NODES: {solution.cypher_script}----')
+  state['script']['nodes'] = solution.cypher_script
+  
+  return {'script':state['script'], **state}
+
+def generate_rel_update_script(state: GraphState):
+  # messages = state['messages']
+  
+  # solution = rel_gen_chain.invoke({
+  #     "messages":messages
+  # })
+  
+  # logger.info(f'----GENERATED UPDATED RELATIONSHIPS: {solution.cypher_script}----')
+  # state['script'].relationships = solution.cypher_script
+  # return {'script':state['script'], **state}
   pass
 
 def update_node(state:GraphState): #TODO refactor this => split into multiple nodes : infer, generate
@@ -476,8 +642,7 @@ def update_node(state:GraphState): #TODO refactor this => split into multiple no
   #   run_cypher_query(update_statement)
   # else:
   #   logger.info('----UPDATE VALIDATION: FAILED----')
-  return {'generation':update,"messages" : messages, "iterations" : iterations}
-  
+  return {'generation':update,"messages" : messages, "iterations" : iterations}  
 
 def component_validation(state: GraphState):
   print('----VALIDATING COMPONENTS----')
@@ -491,7 +656,6 @@ def component_validation(state: GraphState):
     logger.info('----NODE GENERATION VALIDATION: FAILED----')
   else:
     logger.info('----NODE GENERATION VALIDATION: SUCCESS----')
-
 
 def run_script(state: GraphState):
   from neo4j.exceptions import CypherSyntaxError
@@ -753,7 +917,6 @@ def check_end(state: GraphState):
     logger.info('----WORKFLOW FAILED: REDIRECTING TO REFLECT----')
     return 'reflect'
 
-
 def check_existing_node(state: GraphState):
     global already_existing_node
     return already_existing_node
@@ -766,17 +929,21 @@ def inititialize_graph():
     workflow.add_node('relationship_gen', relationships_gen)
     workflow.add_node('metrics_gen', metrics_gen)
     workflow.add_node('cypher_check', cypher_check)
-    #workflow.add_node('update_node', update_node)
-    workflow.add_node('infer', infer_missing_nodes)
-    workflow.add_node('update', generate_update_script) 
+
+    workflow.add_node('infer_node', infer_missing_nodes) # go to node_gen if there are missing nodes, else generate only the metrics
+    workflow.add_node('update_node', generate_node_update_script) 
+    workflow.add_node('infer_relationship', infer_missing_relationships)
+    workflow.add_node('update_relationship', generate_rel_update_script)
     workflow.add_node('reflect', reflect)
     
     workflow.add_edge(START, 'node_existance')
-    workflow.add_conditional_edges('node_existance', check_existing_node, {True: 'infer', False: 'node_gen'}) # checks if the node already exists
+    workflow.add_conditional_edges('node_existance', check_existing_node, {True: 'infer_node', False: 'node_gen'}) # checks if the node already exists
     workflow.add_edge('metrics_gen', 'cypher_check')
     
-    workflow.add_edge('infer', 'update')
-    workflow.add_edge('update', END)
+    workflow.add_edge('infer_node', 'update_node') # add conditional edge to check if there are missing nodes -> update them or go straight to inferring relationships
+    workflow.add_edge('update_node', 'infer_relationship') # add conditional edge to check if there are missing nodes -> update them or go straight to inferring relationships
+    workflow.add_edge('infer_relationship', 'update_relationship') # add conditional edge to check if there are missing relationships -> update them or go straight to generating the metrics
+    workflow.add_edge('update_relationship', END)
     workflow.add_conditional_edges('node_gen' ,check_traceback_reflect_error, {True: 'cypher_check', False: 'relationship_gen'})
     workflow.add_conditional_edges('relationship_gen', check_traceback_reflect_error, {True: 'cypher_check', False: 'metrics_gen'})    
 
@@ -827,7 +994,7 @@ def start_agent(filename='node_exporter_metrics.txt'):
   global processed_components
   global metrics_component
   app = inititialize_graph()
-  #visualize_graph(app)
+  visualize_graph(app)
   logger.info('----STARTING AGENT----')
   question = ChatPromptTemplate([
       ('user',
@@ -866,3 +1033,4 @@ def query_graph(user_nl_query):
 #TODO move all global variables to a main function and start the execution from there
 #TODO change the update-node => split into two nodes, one to infer new components and  one that updates the properties of the existing nodes
 #TODO move all the prompt blocks to another file 
+#TODO make the agent wait before sending requests because the MISTRAL API returns 429 
