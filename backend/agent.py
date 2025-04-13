@@ -1,3 +1,4 @@
+from collections import defaultdict
 import os
 import shutil
 from neo4j import GraphDatabase
@@ -32,6 +33,7 @@ neo4j_pass = os.getenv('NEO4J_PASS')
 driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_username, neo4j_pass))
 graph = Neo4jGraph(url=neo4j_uri, username=neo4j_username, password=neo4j_pass, enhanced_schema=True)
 processed_components = None
+missing_nodes_dict = defaultdict(list)
 class cypher(BaseModel):
   problem: str = Field(description="problem to solve")
   cypher_script: str = Field(description="cypher script to run")
@@ -416,7 +418,7 @@ def infer_missing_nodes(state: GraphState):
   global file_text
   logger.info('----INFERRING MISSING NODES----')
   
-  logger.info(f'{graph.schema}') # based on this schema we can infer the missing nodes
+  #logger.info(f'{graph.schema}') # based on this schema we can infer the missing nodes
   
   # chunk the file
   chunks =  chunk_metrics(file_text)
@@ -438,7 +440,15 @@ def infer_missing_nodes(state: GraphState):
             Steps:
             1. Parse `{chunk}` to extract node names and types.
             2. Compare these against the provided schema (`{graph.schema}`).
-            3. Return a **list of missing nodes**. If all nodes exist, return an **empty list**.
+            3. The label should be all CAPS and should not contain any special characters.
+            4. Ignore any metrics related to the following:
+              - textfile
+              - go_*
+              - promhttp
+              - scrape_*
+              - process_*
+            5. Return a **list of missing nodes**. If all nodes exist, return an **empty list**.
+            6. Do not return existing nodes.
 
             Ensure that nodes are compared strictly by both **name** and **type** before determining if they are missing.
             '''
@@ -449,9 +459,6 @@ def infer_missing_nodes(state: GraphState):
     })
     if not solution:
       logger.info('----NO MISSING NODES----')
-      messages += [
-          ('assistant', 'NO MISSING NODES')
-      ]
     else:
       logger.info(f'----INFERRED NODES: {solution.nodes}----')
       messages += [
@@ -461,34 +468,11 @@ def infer_missing_nodes(state: GraphState):
   
   # remove the duplicates or the false positives
   unique_nodes = list(set(missing_nodes))
-  from collections import defaultdict
-  label_to_nodes = defaultdict(list)
 
   for node in unique_nodes:
-    label_to_nodes[node.label].append(node.name)
-  question = ChatPromptTemplate([
-      ('user',
-      f'''
-      Convert these components into CYPHER nodes. Make it so each label is the key of the dictionary \n
-      and the name of the variable is the label followed by `_` and its id or name. For example: `cpu_0`. \n
-
-      Do not use special characters such as `-` in variable names.
-      
-      For context, the  graph represents a computation unit with various hardware components.
-      Because of that, I need you to add a property to each node that represents the system it is part of. The NODENAME is {processed_components['NODENAME'][0]}.
-      For the `NODENAME` node, do not insert a system property.
-      Do not return any values in the final query.
-      For every node include their name as a property. For example, the `CPU` node with id `0` should have a property `name: "0"`. 
-      
-      Use the MERGE instead of CREATE.
-
-      {label_to_nodes}
-      '''
-      )
-  ]
-  )
-  messages += question  
-  return {"messages": messages,**state}
+    missing_nodes_dict[node.label].append(node.name)
+  
+  return {"messages": messages ,**state}
  
 def infer_missing_relationships(state: GraphState):
   import time
@@ -497,7 +481,7 @@ def infer_missing_relationships(state: GraphState):
   missing_relationships = []
   chunks = chunk_metrics(file_text)
   for chunk in chunks :
-    time.sleep(1.5)
+    time.sleep(1)
     # use the chunk to infer the missing nodes
     messages = [
         (
@@ -506,12 +490,16 @@ def infer_missing_relationships(state: GraphState):
             Infer the relationships between the nodes based on the provided metrics. Use the provided schema to determine existing relationships.
             These are the nodes that were previously inferred: 
             {state['script']['nodes']}
+            
             Steps:
             1. Parse `{chunk}` to extract relationship names and types.
             2. Compare these against the provided schema (`{graph.schema}`).
             3. Return a **list of missing relationships**. If all relationships exist, return an **empty list**.
+            4. Do not return existing relationships.
 
             Ensure that relationships are compared strictly by both **name** and **type** before determining if they are missing.
+            There could be relationships that are not present in the schema, so be careful when inferring the relationships.
+            
             '''
         )
     ]
@@ -533,11 +521,39 @@ def infer_missing_relationships(state: GraphState):
   
 
 def generate_node_update_script(state:GraphState): # TODO route this to the existing node generation node
-  messages = state['messages']
+  question = ChatPromptTemplate([
+      ('user',
+      f"""
+    Convert these components into Cypher statements to create nodes using `MERGE` only. 
+    Do not use `CREATE`.
+
+    For **each** node, use the following pattern:
+    ```
+    MERGE (var:Label {{system: "system_name", name: "node_name"}})
+    ON CREATE SET var.createdAt = timestamp()
+    ON MATCH SET var.lastSeen = timestamp()
+    ```
+
+    - Variable names should follow the format: `label_idOrName` (e.g., `cpu_0`)
+    - Do not use special characters like `-` in variable names
+    - Add a property `system: "{processed_components['NODENAME'][0]}"` to every node **except** the `NODENAME` node
+    - Always include `name: "..."` as a property on the node
+    - Do **not** return any output values in the final query
+
+    For context, the graph represents a computation unit with various hardware components.
+
+    Input:
+    {missing_nodes_dict}
+    """
+      )
+  ]
+  )
   
   solution = cypher_gen_chain.invoke({
-      "messages":messages
+      "messages":question
   })
+  
+  #solution.cypher_script = solution.cypher_script.replace('CREATE ', 'MERGE ')
   
   logger.info(f'----GENERATED UPDATED NODES: {solution.cypher_script}----')
   state['script']['nodes'] = solution.cypher_script
@@ -994,7 +1010,7 @@ def start_agent(filename='node_exporter_metrics.txt'):
   global processed_components
   global metrics_component
   app = inititialize_graph()
-  visualize_graph(app)
+  #visualize_graph(app)
   logger.info('----STARTING AGENT----')
   question = ChatPromptTemplate([
       ('user',
