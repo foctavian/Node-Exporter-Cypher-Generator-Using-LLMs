@@ -34,6 +34,7 @@ driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_username, neo4j_pass))
 graph = Neo4jGraph(url=neo4j_uri, username=neo4j_username, password=neo4j_pass, enhanced_schema=True)
 processed_components = None
 missing_nodes_dict = defaultdict(list)
+missing_rels_dict = []
 class cypher(BaseModel):
   problem: str = Field(description="problem to solve")
   cypher_script: str = Field(description="cypher script to run")
@@ -51,8 +52,8 @@ class Node(BaseModel):
 
 @dataclass(frozen=True)
 class Relationship(BaseModel):
-  source: str = Field(description="name or id of the source node")
-  target: str = Field(description="name or id of the target node")
+  source: Node = Field(description="source node")
+  target: Node  = Field(description="target node")
   relationship: str = Field(description="relationship between the nodes")
 
 class InferredNodes(BaseModel):
@@ -478,6 +479,7 @@ def infer_missing_relationships(state: GraphState):
   import time
   logger.info('----INFERRING MISSING RELATIONSHIPS----')
   global file_text
+  global missing_rels_dict
   missing_relationships = []
   chunks = chunk_metrics(file_text)
   for chunk in chunks :
@@ -499,7 +501,7 @@ def infer_missing_relationships(state: GraphState):
 
             Ensure that relationships are compared strictly by both **name** and **type** before determining if they are missing.
             There could be relationships that are not present in the schema, so be careful when inferring the relationships.
-            
+            There could be relationships between components like cooling devices and processor cores, not only between the main node and components.
             '''
         )
     ]
@@ -517,6 +519,7 @@ def infer_missing_relationships(state: GraphState):
           ('assistant', f"INFERRED RELATIONSHIPS: {solution.relationships}")
       ]
       missing_relationships += solution.relationships
+  missing_rels_dict=missing_relationships
   return {**state}
   
 
@@ -561,104 +564,39 @@ def generate_node_update_script(state:GraphState): # TODO route this to the exis
   return {'script':state['script'], **state}
 
 def generate_rel_update_script(state: GraphState):
-  # messages = state['messages']
+  question = ChatPromptTemplate([
+      ('user',
+      f"""
+    Convert the given relationship objects into Cypher statements that create directed relationships between existing nodes in a Neo4j graph.
+    Do not use CREATE.
+
+    Requirements:
+    1. Use MATCH to find both the source and target nodes.
+    2. Nodes have the label Node and should be matched using the name and system properties.
+    3. Use the label to match the node : ```MATCH (n:label)```
+    4. Use the name and system properties to filter the node: ```MATCH (n:label {{name: `name`, system: `system_name`}}) ```.
+    5. Use MERGE to define the relationship between the matched nodes.
+    6. The relationship type should be the uppercase version of the relationship field.
+    7. Each relationship is directed from source to target.
+    8. Ensure every node is connected in the graph, even if it requires inferring indirect or supporting relationships (e.g., cooling devices to CPU or system node). If a node seems isolated, infer a likely logical connection based on its type and link it appropriately.
+    
+    Context:
+    The graph models a computational unit with interconnected hardware components (like CPU, memory, GPU, etc.).
+
+    Input:
+    {missing_rels_dict}
+    """
+      )
+  ]
+  )
   
-  # solution = rel_gen_chain.invoke({
-  #     "messages":messages
-  # })
+  solution = rel_gen_chain.invoke({
+      "messages":question
+  })
   
-  # logger.info(f'----GENERATED UPDATED RELATIONSHIPS: {solution.cypher_script}----')
-  # state['script'].relationships = solution.cypher_script
-  # return {'script':state['script'], **state}
-  pass
-
-def update_node(state:GraphState): #TODO refactor this => split into multiple nodes : infer, generate
-  logger.info('----UPDATING NODES----')
-  messages = state['messages']
-  iterations = state['iterations']
-  error = state['error']
-  
-  update_statement=[]
-  system_name = processed_components['NODENAME'][0]
-  for label in node_labels[:-1]:
-    if label in metrics_component:
-      metrics =' '.join(metrics_component[label])
-      update_message= [
-          (
-              "user",
-              f'''
-               Task:
-                  Generate Cypher queries to update existing nodes with the correct properties based on the provided metrics. If any nodes or relationships are missing, infer them based on the given data and create them before updating properties.
-
-                  Instructions:
-                    Match the system node using its name and store it with a WITH statement.
-                    Match all related nodes belonging to that system using the system property.
-                    Identify nodes uniquely by using both the system name and either id or name. Do not use additional properties for matching.
-                    Update node properties with the exact values from the provided metrics.
-                    Infer missing nodes:
-                    If a referenced node does not exist, create it using the available data.
-                    Ensure each inferred node has the correct system association.
-                    Infer missing relationships:
-                    If a relationship should exist but is missing, create it before updating properties.
-                    Do not include any RETURN statements in the final queries.
-                    Unpack variables properly: Always reference the system using n.name in subsequent queries.
-                    Use WITH and UNWIND to carry forward variables and process multiple updates efficiently.
-                    The variable names should be a combination of the label and the id or name of the node, separated by an underscore (e.g., cpu_0).
-
-                  Property Handling Rules:
-                    Extract all key-value pairs inside {{ }} as separate properties.
-                    Never use maps or JSON-like structures in Cypher queries.
-                    Use the exact metric values without rounding or approximating.
-                    Retain values exactly as provided, including scientific notation (e.g., 3.1e+09).
-
-                  Expected Query Structure:
-                  MATCH (n:NODENAME) WHERE n.name = '{system_name}'  
-                  WITH n  
-
-                  // Match or create component node
-                  MERGE (c:{{component_label}} {{system: n.name, id: '{{component_id}}'}})  
-                  ON CREATE SET c.name = '{{component_name}}'  // Infer missing name if applicable  
-
-                  // Update properties
-                  SET c.PROPERTY = VALUE  
-                  Use MERGE instead of MATCH to infer and create missing nodes.
-                  Ensure relationships exist before updating properties.
-
-                  Contextual Information:
-                  System to be updated: {system_name}
-
-                  Current Graph Schema:
-                  {graph.schema}
-                  Metrics for processing:
-                  {metrics}
-              '''
-              )
-      ]
-      update = cypher_gen_chain.invoke({'messages':update_message})
-  
-      logger.info(f'----UPDATED NODES: {label}----')
-      update_statement.append(update.cypher_script)
-      logger.info(f'----UPDATE STATEMENT {label}: {update.cypher_script}----')
-      if cypher_validation(update.cypher_script): # if the cypher script is valid
-        logger.info('----UPDATE VALIDATION: SUCCESS----')
-        run_cypher_query(update.cypher_script)
-        logger.info('----UPDATE NODES: SUCCESS----')
-      else: #if the cypher script is invalid, then add the error message
-        logger.info('----UPDATE VALIDATION: FAILED----')
-        # possible to reflect on the error 
-        
-      messages += [
-                (
-                    "assistant",
-                    f"CYPHER RELATIONSHIPS: \n Problem: {update.problem} \n CYPHER: \n {update.cypher_script}",
-                )
-        ]
-  # if cypher_validation(' '.join(update_statement)):
-  #   logger.info('----UPDATE VALIDATION: SUCCESS----')
-  #   run_cypher_query(update_statement)
-  # else:
-  #   logger.info('----UPDATE VALIDATION: FAILED----')
-  return {'generation':update,"messages" : messages, "iterations" : iterations}  
+  logger.info(f'----GENERATED UPDATED RELATIONSHIPS: {solution.cypher_script}----')
+  state['script'].relationships = solution.cypher_script
+  return {'script':state['script'], **state}
 
 def component_validation(state: GraphState):
   print('----VALIDATING COMPONENTS----')
@@ -1045,8 +983,6 @@ def query_graph(user_nl_query):
   return neo4j_chain.invoke({'query':user_nl_query})
   
 
-#TODO implement the update node and relationship system
 #TODO move all global variables to a main function and start the execution from there
-#TODO change the update-node => split into two nodes, one to infer new components and  one that updates the properties of the existing nodes
 #TODO move all the prompt blocks to another file 
-#TODO make the agent wait before sending requests because the MISTRAL API returns 429 
+#TODO update function return to be more concise
