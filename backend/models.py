@@ -40,7 +40,7 @@ class InferredRelationships(BaseModel):
 
 class InferredProperties(BaseModel):
   problem: str = Field(description="problem to solve")
-  properties: List[Property] = Field(description="list of properties to create")
+  properties: List[Property] = Field(description="list of inferred properties")
   
 class GraphState(TypedDict):
   error : str

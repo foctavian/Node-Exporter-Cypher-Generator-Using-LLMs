@@ -577,21 +577,21 @@ def generate_node_update_script(state:GraphState): # TODO route this to the exis
   
   return {'script':state['script'], **state}
 
-def infer_missing_metrics(state: GraphState):
+async def infer_missing_metrics(state: GraphState):
   import time
-  logger.info('----INFERRING MISSING METRICS----')
+  import asyncio
+  logger.info('----INFERRING MISSING METRICS USING ASYNC----')
   global file_text
   global missing_props_dict
+  all_messages = []
+  all_responses = []
   missing_props = []
   chunks = chunk_metrics(file_text)
   
-  for chunk in chunks :
-    time.sleep(0.5)
-    
-    messages = [
-      (
-        "user",
-        f'''
+  
+  #TEST ASYNC
+  for chunk in chunks:
+    prompt = f'''
         Infer the properties of the nodes based on the provided metrics. Use the provided schema to determine existing properties and nodes.
         This is the schema of the graph:
         {graph.schema}
@@ -602,26 +602,38 @@ def infer_missing_metrics(state: GraphState):
         1. Parse `{chunk}` to extract property names and values.
         2. Return a **list of missing properties**. If all properties exist, return an **empty list**.
         3. Do not return existing properties.
-        
-        '''
-      )
-    ]
-    
-    solution = property_inferring_chain.invoke({
-        "messages":messages
-    })
-    
-    if not solution:
-      logger.info('----NO MISSING PROPERTIES----')
-    else:
-      logger.info(f'----INFERRED PROPERTIES: {solution.properties}----')
-      messages += [
-          ('assistant', f"INFERRED PROPERTIES: {solution.properties}")
-      ]
-      missing_props_dict += solution.properties
+    '''
+    all_messages.append(prompt)
+  concurrent_batch_size = 3
+  start_time = time.time()
+  for i in range(0, len(all_messages), concurrent_batch_size):
+    batch = all_messages[i:i+concurrent_batch_size]
+    try:
+      all_responses.extend(await property_inferring_chain.abatch(batch))
+      if i+concurrent_batch_size < len(all_messages):
+        await asyncio.sleep(1)
+    except Exception as e:
+      logger.error(f"Error processing batch {i//concurrent_batch_size}: {e}")
+      await asyncio.sleep(5)
+      for msg in batch:
+        try:
+          response = await property_inferring_chain.ainvoke(msg)
+          all_responses.append(response)
+          await asyncio.sleep(0.5)
+        except Exception as inner_e:
+          logger.error(f"Failed individual request: {inner_e}")
+          
+  end_time = time.time()
+  logger.warning(f"Batch processing took {end_time - start_time:.2f} seconds.")
+  logger.warning(f"{all_responses}")
+  
+  for response in all_responses:
+    for prop in response.properties:
+      if prop not in missing_props_dict:
+        missing_props_dict.append(prop) #PLACEHOLDER TODO: REFACTOR IT 
   
   return {**state}
-    
+  
 
 def generate_metric_update_script(state: GraphState):
   logger.info(f'GENERATING METRICS UPDATE SCRIPT : {len(missing_props_dict)}')
