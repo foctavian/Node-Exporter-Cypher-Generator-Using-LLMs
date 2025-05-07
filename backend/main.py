@@ -39,7 +39,7 @@ async def upload_metrics_file(file:UploadFile=File(...)):
     try:
         with open(file_location, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-            AgentInterface().start_processing(file_location)
+            await AgentInterface().start_processing(file_location)
         return {'message': f"File {file.filename} was uploaded successfully"}
     except Exception as e:
         return {'error':f"File {file.filename} failed: {str(e)}"} 

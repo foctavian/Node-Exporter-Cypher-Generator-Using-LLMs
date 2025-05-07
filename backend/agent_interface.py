@@ -11,8 +11,8 @@ class AgentInterface():
         '''
         return driver.execute_query(q)
     
-    def start_processing(self, filename):
-        solution = start_agent(filename)
+    async def start_processing(self, filename):
+        solution = await start_agent(filename)
         return solution
     
     def query_graph(self, user_query):
