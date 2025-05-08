@@ -50,7 +50,7 @@ async def test_question(data:Message):
     solution = cypher_gen_chain.invoke({'messages':[('user', data.question)]})
     return solution
 
-@app.post("/query-graph")
+@app.post("/query-graph") #TODO: fix error 429
 async def query_graph(query: Message):
     return AgentInterface().query_graph(query.question)
     

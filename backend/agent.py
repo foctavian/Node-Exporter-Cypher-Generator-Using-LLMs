@@ -548,7 +548,7 @@ def generate_node_update_script(state:GraphState): # TODO route this to the exis
     ```
     MERGE (var:Label {{system: "system_name", name: "node_name"}})
     ON CREATE SET var.createdAt = timestamp()
-    ON MATCH SET var.lastSeen = timestamp()
+    ON MATCH SET var.updatedAt = timestamp()
     ```
 
     - Variable names should follow the format: `label_idOrName` (e.g., `cpu_0`)
@@ -556,6 +556,7 @@ def generate_node_update_script(state:GraphState): # TODO route this to the exis
     - Add a property `system: "{processed_components['NODENAME'][0]}"` to every node **except** the `NODENAME` node
     - Always include `name: "..."` as a property on the node
     - Do **not** return any output values in the final query
+    - The `NODENAME` node should not have a system property
 
     For context, the graph represents a computation unit with various hardware components.
 
@@ -628,10 +629,11 @@ async def infer_missing_metrics(state: GraphState):
   logger.warning(f"{all_responses}")
   
   for response in all_responses:
-    for prop in response.properties:
-      if prop not in missing_props_dict:
-        missing_props_dict.append(prop) #PLACEHOLDER TODO: REFACTOR IT 
-  
+    if response and len(response.properties)>0:
+      for prop in response.properties:
+        if prop not in missing_props_dict:
+          missing_props_dict.append(prop) #PLACEHOLDER TODO: REFACTOR IT 
+    
   return {**state}
   
 
