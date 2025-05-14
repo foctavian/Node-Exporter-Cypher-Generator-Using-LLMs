@@ -10,6 +10,7 @@ from datetime import datetime
 import logging
 from apscheduler.schedulers.background import BackgroundScheduler
 from typing import Set 
+from file_manager import encode_file
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(filename='logs.log', encoding='utf-8', level=logging.INFO)
@@ -18,11 +19,14 @@ seen_files: Set[str] = set()
 
 def check_for_new_files():
     global seen_files
+    dr = 'uploads'
     try:
-        current_files = set(os.listdir('./uploads'))
+        current_files = set(os.listdir('uploads'))
         new_files = current_files - seen_files
         if new_files:
             print(f"New files detected: {new_files}")
+            for f in new_files:
+                encode_file(os.path.join(dr, f)) 
         seen_files = current_files
     except Exception as e:
         print(e)
