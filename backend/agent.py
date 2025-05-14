@@ -22,7 +22,8 @@ import httpx
 from langchain_core.tools import tool
 from tools import check_if_entity_exists
 from models import *
-
+from datetime import datetime, timezone
+from fastapi import HTTPException
 logger = logging.getLogger(__name__)
 logging.basicConfig(filename='logs.log', level=logging.INFO)
 
@@ -1103,7 +1104,38 @@ async def start_agent(filename='node_exporter_metrics.txt'):
   solution = await app.ainvoke({"messages":messages, "iterations":0, "error":"", 'script':empty_script, 'traceback':False})
   return solution
 
-def query_graph(user_nl_query):
-  print(graph.schema)
-  return neo4j_chain.invoke({'query':user_nl_query})
+async def query_graph(user_nl_query):
+  #print(graph.schema)
+  return await neo4j_chain.ainvoke({'query':user_nl_query})
+
+# IP refers to the hash of the nodename 
+
+async def start_update(ip, name, timestamp):
+  # find the file that has this specific IP and name
+  try:
+    client_time = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+  except ValueError:
+    raise HTTPException(status_code=400, detail="Invalid timestamp format")
+  uploads_folder = './uploads'
+
+  for f in os.listdir(uploads_folder):
+    if f.startswith(ip):
+      file_timestamp = os.path.splitext(f)[0].split('_')[2]
+      file_time_naive = datetime.strptime(file_timestamp, "%Y-%m-%d;%H:%M:%S.%f")
+      file_time = file_time_naive.replace(tzinfo=timezone.utc)
+      timestamp_diff = (client_time - file_time).total_seconds()
+      print("Found file!")
+      print(f"file timestamp:{file_timestamp}")
+      print(f"timestamp:{timestamp}")
+      print(f"difference:{timestamp_diff}")
+      if timestamp_diff == 0:
+        return {"message":"Update not found!"}
+      elif timestamp_diff > 0:
+        # we need to start the update
+        print(f"Starting to process file: {f}")
+        return await start_agent(filename=os.path.join('uploads', f))
+  return {"message":"File not found"}      
+      
+
+  
 

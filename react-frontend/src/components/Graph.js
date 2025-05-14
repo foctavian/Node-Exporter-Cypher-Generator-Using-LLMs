@@ -12,8 +12,22 @@ const Graph = () => {
   const [messages, setMessages] = useState([]);
   const [isTyping, setIsTyping] = useState(false);
   const messagesEndRef = useRef(null);
+  const [nodeIPS, setNodeIPS] = useState([]);
+  const [updateStatus, setUpdateStatus] = useState({});
+  const [systems, setSystems] = useState([]);
 
-  const [answer, setAnswer] = useState("");
+  const initSystems = (nodes) => {
+    nodes.map((node) => {
+      let name = atob(node);
+      setSystems([
+        ...systems,
+        {
+          IP: node,
+          name: name,
+        },
+      ]);
+    });
+  };
 
   useEffect(() => {
     async function fetchGraph() {
@@ -26,7 +40,17 @@ const Graph = () => {
         console.error(error);
       }
     }
+    async function fetchNodeIPS() {
+      try {
+        const response = await axios.get("http://localhost:8000/get-node-ips");
+        setNodeIPS(response.data);
+        initSystems(response.data);
+      } catch (error) {
+        console.error(error);
+      }
+    }
     fetchGraph();
+    fetchNodeIPS();
   }, []);
 
   const handleKeyPress = (e) => {
@@ -38,13 +62,13 @@ const Graph = () => {
 
   const sendQuestion = async () => {
     setMessages((old) => [...old, { role: "user", content: question }]);
-    setQuestion("");
     try {
       const response = await axios.post(
         "http://localhost:8000/query-graph",
         { question },
         { headers: { "Content-Type": "application/json" } }
       );
+      setQuestion("");
       setMessages((old) => [
         ...old,
         { role: "bot", content: response.data.result },
@@ -115,9 +139,85 @@ const Graph = () => {
     });
   };
 
+  const startAgent = async (ip) => {
+    const node_to_update = {
+      ip: ip,
+      name: atob(ip),
+      timestamp: new Date().toISOString().valueOf()
+    };
+
+    try {
+      console.log("pressed");
+
+      const response = await axios.post(
+        "http://localhost:8000/start-update",
+        node_to_update,
+        { headers: { "Content-Type": "application/json" } }
+      );
+      console.log(response);
+    } catch (error) {
+      console.error(error);
+    }
+  };
+
+  const startNodeUpdate = async (e) => {
+    const ip = e.target.id;
+    try {
+      const result = await startAgent(ip);
+      console.log(result);
+    } catch {
+      setUpdateStatus((prev) => ({ ...prev, [ip]: "failed" }));
+    }
+  };
+
+  const getDotColor = (status) => {
+    switch (status) {
+      case "pending":
+        return "yellow";
+      case "success":
+        return "green";
+      case "failed":
+        return "red";
+      default:
+        return "gray";
+    }
+  };
+
   return (
     <div className="app-container">
+      <div className="top-header">
+        <div className="header-page-title">Knowledge Graphs</div>
+      </div>
       <div className="main-row">
+        <div className="node-info-sidebar">
+          <h2>Node Info</h2>
+          <div className="system-list">
+            {systems.map((system, _) => (
+              <div className="system-list-child" id={system.IP}>
+                <>
+                  <span
+                    className="dot"
+                    style={{
+                      backgroundColor: getDotColor(updateStatus[system.IP]),
+                    }}
+                  >
+                    {" "}
+                  </span>
+                </>
+                {system.name}
+                Last Update
+                <button
+                  className="system-list-button"
+                  id={system.IP}
+                  onClick={startNodeUpdate}
+                >
+                  Update
+                </button>
+                <br></br>
+              </div>
+            ))}
+          </div>
+        </div>
         <div ref={graphContainerRef} id="graph-container"></div>
         <div className={`sidebar ${selectedNode ? "" : "hidden"}`}>
           {selectedNode && (
@@ -132,17 +232,13 @@ const Graph = () => {
         </div>
       </div>
       <div className="chat-container">
-        {/* Chat Messages */}
         <div className="chat-history">
           {messages.map((message, index) => (
             <div key={index} className={`message ${message.role}-message`}>
-                <div
-                className="message-content"
-                >
-              <strong >{message.role === "user" ? "User" : "Bot"}:
-                </strong>{" "}
+              <div className="message-content">
+                <strong>{message.role === "user" ? "User" : "Bot"}:</strong>{" "}
                 {message.content}
-                </div>
+              </div>
             </div>
           ))}
           <div ref={messagesEndRef} />

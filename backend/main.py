@@ -1,18 +1,49 @@
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 import os
+from contextlib import asynccontextmanager
 import shutil
 from agent import cypher_gen_chain
 from pydantic import BaseModel
 from agent_interface import AgentInterface
+from datetime import datetime
 import logging
+from apscheduler.schedulers.background import BackgroundScheduler
+from typing import Set 
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(filename='logs.log', encoding='utf-8', level=logging.INFO)
 
-app = FastAPI()
+seen_files: Set[str] = set()
+
+def check_for_new_files():
+    global seen_files
+    try:
+        current_files = set(os.listdir('./uploads'))
+        new_files = current_files - seen_files
+        if new_files:
+            print(f"New files detected: {new_files}")
+        seen_files = current_files
+    except Exception as e:
+        print(e)
+ 
+
+@asynccontextmanager
+async def lifespan(app:FastAPI):
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(check_for_new_files, 'interval', seconds=10) 
+    scheduler.start()
+    yield
+    scheduler.shutdown()   
+    
+app = FastAPI(lifespan=lifespan)
 class Message(BaseModel):
     question:str
+    
+class UpdateSystemNode(BaseModel):
+    ip: str
+    name: str
+    timestamp: str
 
 origins = [
     "*"
@@ -36,6 +67,7 @@ async def upload_metrics_file(file:UploadFile=File(...)):
     if not os.path.exists(dir):
         os.makedirs(dir)
     file_location = os.path.join(dir, file.filename)
+
     try:
         with open(file_location, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
@@ -52,9 +84,23 @@ async def test_question(data:Message):
 
 @app.post("/query-graph") #TODO: fix error 429
 async def query_graph(query: Message):
-    return AgentInterface().query_graph(query.question)
-    
+    try:
+        return await AgentInterface().query_graph(query.question)
+    except Exception as e:
+        import asyncio
+        await asyncio.sleep(3)
+        return await AgentInterface().query_graph(query.question)
 
+@app.get('/get-node-ips')
+async def get_node_ips():
+    dr = './uploads'
+    node_ids = set()
+    for f in os.listdir(dr):
+        node_id = f.split('_')[0]
+        print(node_id)
+        node_ids.add(node_id)
+    return node_ids
+        
 @app.get('/get-current-graph')
 async def get_current_graph():
     records, summary, keys = AgentInterface().retrieve_current_graph()
@@ -74,7 +120,16 @@ async def get_current_graph():
 
     return graph_data
 
+@app.post('/start-update')
+async def start_update(node_to_update: UpdateSystemNode):
+    await AgentInterface().start_update(node_to_update.ip, node_to_update.name, node_to_update.timestamp)
+
 @app.get('/start-processing')
 async def start_processing():
     AgentInterface().start_processing()
     
+
+    
+    
+    
+#TODO change their name and create a synced task that checks if there are any updates
