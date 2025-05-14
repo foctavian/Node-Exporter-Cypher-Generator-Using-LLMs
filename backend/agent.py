@@ -248,6 +248,7 @@ neo4j_chain = GraphCypherQAChain.from_llm(
   graph=graph,
   verbose=True,
   allow_dangerous_requests=True,
+  return_intermediate_steps=True,
   function_response_system='Respond in a structured format with the question and the cypher query.',
   validate_cypher=True) 
 

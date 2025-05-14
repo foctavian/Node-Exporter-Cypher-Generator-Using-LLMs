@@ -240,3 +240,7 @@
 .system-list-button:hover {
   background-color: #2980b9;
 }
+
+.message-content-bot:hover {
+  cursor:pointer;
+}

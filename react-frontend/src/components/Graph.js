@@ -16,19 +16,20 @@ const Graph = () => {
   const [updateStatus, setUpdateStatus] = useState({});
   const [systems, setSystems] = useState([]);
 
-const initSystems = (nodesObj) => {
-  const newSystems = Object.entries(nodesObj).map(([encodedNode, timestamp]) => {
-    const name = atob(encodedNode);
-    return {
-      IP: encodedNode,
-      name: name,
-      timestamp: timestamp,
-    };
-  });
+  const initSystems = (nodesObj) => {
+    const newSystems = Object.entries(nodesObj).map(
+      ([encodedNode, timestamp]) => {
+        const name = atob(encodedNode);
+        return {
+          IP: encodedNode,
+          name: name,
+          timestamp: timestamp,
+        };
+      }
+    );
 
-  setSystems(newSystems); 
-};
-
+    setSystems(newSystems);
+  };
 
   useEffect(() => {
     async function fetchGraph() {
@@ -72,7 +73,11 @@ const initSystems = (nodesObj) => {
       setQuestion("");
       setMessages((old) => [
         ...old,
-        { role: "bot", content: response.data.result },
+        {
+          role: "bot",
+          query: response.data.cypher_query[0].query,
+          content: response.data.result,
+        },
       ]);
     } catch (error) {
       console.error(error);
@@ -144,7 +149,7 @@ const initSystems = (nodesObj) => {
     const node_to_update = {
       ip: ip,
       name: atob(ip),
-      timestamp: new Date().toISOString().valueOf()
+      timestamp: new Date().toISOString().valueOf(),
     };
 
     try {
@@ -192,36 +197,35 @@ const initSystems = (nodesObj) => {
       <div className="main-row">
         <div className="node-info-sidebar">
           <h2>Node Info</h2>
-         <div className="system-list">
-  {systems.map((system) => (
-    <div className="system-list-child" id={system.IP} key={system.IP}>
-      <div className="system-header">
-        <span
-          className="dot"
-          style={{
-            backgroundColor: getDotColor(updateStatus[system.IP]),
-          }}
-        ></span>
-        <span className="system-name">{system.name}</span>
-      </div>
+          <div className="system-list">
+            {systems.map((system) => (
+              <div className="system-list-child" id={system.IP} key={system.IP}>
+                <div className="system-header">
+                  <span
+                    className="dot"
+                    style={{
+                      backgroundColor: getDotColor(updateStatus[system.IP]),
+                    }}
+                  ></span>
+                  <span className="system-name">{system.name}</span>
+                </div>
 
-      <div className="system-info">
-        <span className="system-timestamp">
-          <strong>Last Update:</strong> {system.timestamp}
-        </span>
-      </div>
+                <div className="system-info">
+                  <span className="system-timestamp">
+                    <strong>Last Update:</strong> {system.timestamp}
+                  </span>
+                </div>
 
-      <button
-        className="system-list-button"
-        id={system.IP}
-        onClick={startNodeUpdate}
-      >
-        Update
-      </button>
-    </div>
-  ))}
-</div>
-
+                <button
+                  className="system-list-button"
+                  id={system.IP}
+                  onClick={startNodeUpdate}
+                >
+                  Update
+                </button>
+              </div>
+            ))}
+          </div>
         </div>
         <div ref={graphContainerRef} id="graph-container"></div>
         <div className={`sidebar ${selectedNode ? "" : "hidden"}`}>
@@ -239,7 +243,13 @@ const initSystems = (nodesObj) => {
       <div className="chat-container">
         <div className="chat-history">
           {messages.map((message, index) => (
-            <div key={index} className={`message ${message.role}-message`}>
+            <div
+              key={index}
+              className={`message ${message.role}-message`}
+              title={
+                message.role === "bot" && message.query ? message.query : ""
+              }
+            >
               <div className="message-content">
                 <strong>{message.role === "user" ? "User" : "Bot"}:</strong>{" "}
                 {message.content}

@@ -89,11 +89,13 @@ async def test_question(data:Message):
 @app.post("/query-graph") #TODO: fix error 429
 async def query_graph(query: Message):
     try:
-        return await AgentInterface().query_graph(query.question)
-    except Exception as e:
+        response = await AgentInterface().query_graph(query.question)
+        return {"cypher_query":response['intermediate_steps'], "result":response['result']}
+    except Exception as _:
         import asyncio
         await asyncio.sleep(3)
-        return await AgentInterface().query_graph(query.question)
+        response = await AgentInterface().query_graph(query.question)
+        return {"cypher_query":response['intermediate_steps'], "result":response['result']}
 
 @app.get('/get-node-ips')
 async def get_node_ips():
@@ -132,6 +134,7 @@ async def get_current_graph():
 async def start_update(node_to_update: UpdateSystemNode):
     scheduler.pause_job("file-manager")
     await AgentInterface().start_update(node_to_update.ip, node_to_update.name, node_to_update.timestamp)
+    scheduler.resume_job("file-manager")
 
 @app.get('/start-processing')
 async def start_processing():
