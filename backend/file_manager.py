@@ -35,6 +35,7 @@ def is_encoded(filename):
     except Exception:
         return False
     return True
+
 def encode_file(filename):
     from os import rename, path
     if not is_encoded(filename):
@@ -42,7 +43,7 @@ def encode_file(filename):
         nodename = extract_nodename(filename)
         enc_nodename = base64.urlsafe_b64encode(nodename.encode()).decode()
         enc_filename = base64.urlsafe_b64encode(filename.encode()).decode()
-        timestamp = datetime.now(timezone.utc).isoformat()
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d;%H:%M:%S.%f")
         new_filename = path.join(dr,enc_nodename+'_'+enc_filename+'_'+str(timestamp)+'.txt')
         rename(filename, new_filename)
 # use the name of the nodename and the name of the file as it comes and than hash it => unique IP separated by a _

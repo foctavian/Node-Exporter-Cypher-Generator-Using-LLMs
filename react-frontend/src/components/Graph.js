@@ -16,18 +16,19 @@ const Graph = () => {
   const [updateStatus, setUpdateStatus] = useState({});
   const [systems, setSystems] = useState([]);
 
-  const initSystems = (nodes) => {
-    nodes.map((node) => {
-      let name = atob(node);
-      setSystems([
-        ...systems,
-        {
-          IP: node,
-          name: name,
-        },
-      ]);
-    });
-  };
+const initSystems = (nodesObj) => {
+  const newSystems = Object.entries(nodesObj).map(([encodedNode, timestamp]) => {
+    const name = atob(encodedNode);
+    return {
+      IP: encodedNode,
+      name: name,
+      timestamp: timestamp,
+    };
+  });
+
+  setSystems(newSystems); 
+};
+
 
   useEffect(() => {
     async function fetchGraph() {
@@ -191,32 +192,36 @@ const Graph = () => {
       <div className="main-row">
         <div className="node-info-sidebar">
           <h2>Node Info</h2>
-          <div className="system-list">
-            {systems.map((system, _) => (
-              <div className="system-list-child" id={system.IP}>
-                <>
-                  <span
-                    className="dot"
-                    style={{
-                      backgroundColor: getDotColor(updateStatus[system.IP]),
-                    }}
-                  >
-                    {" "}
-                  </span>
-                </>
-                {system.name}
-                Last Update
-                <button
-                  className="system-list-button"
-                  id={system.IP}
-                  onClick={startNodeUpdate}
-                >
-                  Update
-                </button>
-                <br></br>
-              </div>
-            ))}
-          </div>
+         <div className="system-list">
+  {systems.map((system) => (
+    <div className="system-list-child" id={system.IP} key={system.IP}>
+      <div className="system-header">
+        <span
+          className="dot"
+          style={{
+            backgroundColor: getDotColor(updateStatus[system.IP]),
+          }}
+        ></span>
+        <span className="system-name">{system.name}</span>
+      </div>
+
+      <div className="system-info">
+        <span className="system-timestamp">
+          <strong>Last Update:</strong> {system.timestamp}
+        </span>
+      </div>
+
+      <button
+        className="system-list-button"
+        id={system.IP}
+        onClick={startNodeUpdate}
+      >
+        Update
+      </button>
+    </div>
+  ))}
+</div>
+
         </div>
         <div ref={graphContainerRef} id="graph-container"></div>
         <div className={`sidebar ${selectedNode ? "" : "hidden"}`}>

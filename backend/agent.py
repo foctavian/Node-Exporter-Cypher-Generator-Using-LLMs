@@ -24,6 +24,7 @@ from tools import check_if_entity_exists
 from models import *
 from datetime import datetime, timezone
 from fastapi import HTTPException
+import time
 logger = logging.getLogger(__name__)
 logging.basicConfig(filename='logs.log', level=logging.INFO)
 
@@ -814,135 +815,227 @@ def relationships_gen(state: GraphState):
   #print("Generated relationships:", relationships)
   return {'generation':relationships,"messages" : messages, "iterations" : iterations, "script":script, 'traceback':traceback}
 
-def metrics_gen(state:GraphState): #TODO: refactor this code to be more modular ; also change name to be more specific
-  global nodes_cypher
-  global iterations
-  global init_graph
-  logger.info('----GENERATING METRICS----')
-  generated_metrics_script=[]
-
-  messages = state['messages']
-  iterations = state['iterations']
-  error = state['error']
-  script = state['script']
-  traceback = state['traceback']
-  
-  
-  if 'yes' in error:
-    _, _, err_msg = error.split(':', 2)
-    logger.info('----METRICS RETRYING GENERATION----')
-    messages += [
-        (
-                "user",
-                f'''Now, try again. Fix this error: {err_msg}. \n
-                Provide the whole query with the error fixed. \n
-                ''',
-            )
-    ]
+def metrics_gen(state: GraphState):
+    """
+    Generate and process metrics for a graph state with error handling and rate limiting.
     
-    regenerated_metrics = metrics_gen_chain.invoke({
-        "messages":messages
-    })
-    script['properties'] = regenerated_metrics.cypher_script
-    logger.info(f'----REGENERATED METRICS: {regenerated_metrics.cypher_script}----')
-    messages += [
-        ('assistant', f"METRICS: {regenerated_metrics}")
-    ]
-    init_graph=True
-    return {'generation':regenerated_metrics, "messages" : messages, "iterations" : iterations, "script":script, 'traceback':traceback} 
-  
-  for label in node_labels[:-1]:
-    if label=='GPU':
-      continue
-    if label in metrics_component:
-      metrics =' '.join(metrics_component[label])
-      logger.warning(f'METRICS: {label} SIZE {len(metrics)}')
-      if len(metrics) > 5000:
-        chunks = chunk_metrics(metrics)
-        for chunk in chunks:
-          metrics_message=[
-            (
-              "user",
-              f'''
-            Generate Cypher queries to insert metrics into an existing Neo4j graph.
-
-            The metrics should be added as properties of the appropriate nodes that are already created in the graph.
-            Use the following syntax to update node properties:
-              `MATCH (n:LABEL {{id: VALUE}} {{n.system=`system_name`}}) SET n.PROPERTY = METRIC_VALUE`
-            Example: Given the metric node_cpu_frequency_max_hertz{{cpu="0"}} 3.1e+09, update the node with label CPU and id: "0" by setting max_hertz = 3.1e+09.
-            Each key-value pair inside {{}} must be set as an individual property. Do not treat them as a single map.
-            If a metric has multiple attributes (e.g., node_network_info{{address="02:42:db:56:1c:74", adminstate="up"}}), split them into separate properties like
-              `MATCH (n:Network {{n.system=`system_name`}}) SET n.address = "02:42:db:56:1c:74", n.adminstate = "up"`    
-            **Rules to follow:**
-            - Never use maps or JSON-like structures in Cypher queries. Each attribute must be a separate property.
-            - **Do not use `WITH` or `UNWIND` statements.**
-            - **Ensure every `MATCH` query ends with `;`** before generating the next one.
-            - **Batch updates:** If multiple properties are set for the same node, use a **single `MATCH` statement** and multiple `SET` clauses.
-            - Do not approximate values—use the exact values provided.
-            - Never return anything; no `RETURN` statements.
-            - Use the name or id of the NODENAME node to match the correct nodes. Every node has a property that represents the system it's part of.
-
-            Existing Nodes:
-            {nodes_cypher}
-
-            Metrics to Convert:
-            {chunk}
-              '''
-            )
-          ]
-          logger.info(f'----GENERATED METRICS: {label}----')
-          gen_metrics = metrics_gen_chain.invoke({'messages':metrics_message})
-          if gen_metrics:
-            generated_metrics_script.append(gen_metrics.cypher_script.replace('\n', ''))
-      else:
-        metrics_message=[
-          (
-            "user",
-            f'''
-          Generate Cypher queries to insert metrics into an existing Neo4j graph.
-
-          The metrics should be added as properties of the appropriate nodes that are already created in the graph.
-          Use the following syntax to update node properties:
-            `MATCH (n:LABEL {{id: VALUE}} {{n.system=`system_name`}}) SET n.PROPERTY = METRIC_VALUE`
-          Example: Given the metric node_cpu_frequency_max_hertz{{cpu="0"}} 3.1e+09, update the node with label CPU and id: "0" by setting max_hertz = 3.1e+09.
-          Each key-value pair inside {{}} must be set as an individual property. Do not treat them as a single map.
-          If a metric has multiple attributes (e.g., node_network_info{{address="02:42:db:56:1c:74", adminstate="up"}}), split them into separate properties like
-            `MATCH (n:Network {{n.system=`system_name`}}) SET n.address = "02:42:db:56:1c:74", n.adminstate = "up"`    
-           **Rules to follow:**
-            - Never use maps or JSON-like structures in Cypher queries. Each attribute must be a separate property.
-            - **Do not use `WITH` or `UNWIND` statements.**
-            - **Ensure every `MATCH` query ends with `;`** before generating the next one.
-            - **Batch updates:** If multiple properties are set for the same node, use a **single `MATCH` statement** and multiple `SET` clauses.
-            - Do not approximate values—use the exact values provided.
-            - Never return anything; no `RETURN` statements.
-          
-          For context, the  graph represents a computation unit with various hardware components. 
-
-          Existing Nodes:
-          {nodes_cypher}
-
-          Metrics to Convert:
-          {metrics}
-            '''
-          )
-        ]
-        logger.info(f'----GENERATED METRICS: {label}----')
-        gen_metrics = metrics_gen_chain.invoke({'messages':metrics_message})
-        if gen_metrics:
-          generated_metrics_script.append(gen_metrics.cypher_script.replace('\n', ''))
+    Args:
+        state: GraphState object containing messages, iterations, error, script, and traceback
+        
+    Returns:
+        dict: Updated state with generated metrics
+    """
+    logger.info('----GENERATING METRICS----')
     
-  messages += [
+    # Extract state variables
+    messages = state['messages']
+    iterations = state['iterations']
+    error = state['error']
+    script = state['script']
+    traceback = state['traceback']
+    generated_metrics_script = []
+    
+    # Handle existing errors
+    if 'yes' in error:
+        return _handle_error_regeneration(state)
+    
+    # Process metrics for each node label
+    for label in node_labels[:-1]:
+        if label in metrics_component:
+            metrics = ' '.join(metrics_component[label])
+            logger.info(f'METRICS: {label} SIZE {len(metrics)}')
+            
+            # Process metrics based on size
+            if len(metrics) == 0:
+              continue
+            elif len(metrics) > 5000:
+                _process_large_metrics(label, metrics, generated_metrics_script)
+            else:
+                _process_standard_metrics(label, metrics, generated_metrics_script)
+    
+    # Update messages with generated metrics
+    messages += [
         (
             "assistant",
             f"CYPHER METRICS: \n {' '.join(generated_metrics_script)}",
         )
     ]
-  
-  script['properties'] = " ".join(generated_metrics_script)
     
-  init_graph=True
-  solution=cypher(problem='Metrics', cypher_script=' '.join(generated_metrics_script))
-  return {'generation':solution, "messages" : messages, "iterations" : iterations, "script":script, 'traceback':traceback} 
+    # Update script with properties
+    script['properties'] = " ".join(generated_metrics_script)
+    
+    # Create solution
+    combined_metrics = ' '.join(generated_metrics_script)
+    solution = cypher(problem='Metrics', cypher_script=combined_metrics)
+    
+    return {
+        'generation': solution, 
+        "messages": messages, 
+        "iterations": iterations, 
+        "script": script, 
+        'traceback': traceback
+    }
+
+
+def _handle_error_regeneration(state):
+    """Handle error regeneration with retry logic and rate limiting."""
+    global init_graph
+    
+    messages = state['messages']
+    iterations = state['iterations']
+    script = state['script']
+    traceback = state['traceback']
+    error = state['error']
+    
+    # Extract error message
+    _, _, err_msg = error.split(':', 2)
+    logger.info('----METRICS RETRYING GENERATION----')
+    
+    # Add error message to the conversation
+    messages += [
+        (
+            "user",
+            f'''Now, try again. Fix this error: {err_msg}. \n
+            Provide the whole query with the error fixed. \n
+            ''',
+        )
+    ]
+    
+    # Attempt regeneration with rate limit handling
+    max_retries = 3
+    retry_count = 0
+    backoff_time = 2  # Initial backoff in seconds
+    
+    while retry_count < max_retries:
+        try:
+            regenerated_metrics = metrics_gen_chain.invoke({
+                "messages": messages
+            })
+            script['properties'] = regenerated_metrics.cypher_script
+            logger.info(f'----REGENERATED METRICS: {regenerated_metrics.cypher_script}----')
+            
+            messages += [
+                ('assistant', f"METRICS: {regenerated_metrics}")
+            ]
+            
+            init_graph = True
+            return {
+                'generation': regenerated_metrics, 
+                "messages": messages, 
+                "iterations": iterations, 
+                "script": script, 
+                'traceback': traceback
+            }
+            
+        except Exception as e:
+            if hasattr(e, 'status_code') and e.status_code == 429:
+                # Handle rate limiting with exponential backoff
+                retry_count += 1
+                logger.warning(f"Rate limit hit (429). Retry {retry_count}/{max_retries}. Waiting {backoff_time}s")
+                time.sleep(backoff_time)
+                backoff_time *= 2  # Exponential backoff
+            else:
+                # Log other exceptions and add to traceback
+                logger.error(f"Error during metrics regeneration: {str(e)}")
+                traceback += f"\nMetrics regeneration error: {str(e)}"
+                break
+    
+    # If all retries failed, return with error info
+    logger.error("All retries failed for metrics regeneration")
+    return {
+        'generation': None,
+        "messages": messages,
+        "iterations": iterations,
+        "script": script,
+        'traceback': traceback + "\nFailed to regenerate metrics after multiple attempts."
+    }
+
+
+def _process_large_metrics(label, metrics, generated_metrics_script):
+    """Process large metrics by chunking them."""
+    chunks = chunk_metrics(metrics)
+    for chunk_index, chunk in enumerate(chunks):
+        try:
+            _generate_metrics_with_retry(label, chunk, generated_metrics_script, f"chunk {chunk_index+1}/{len(chunks)}")
+        except Exception as e:
+            logger.error(f"Failed to process metrics chunk for {label}: {str(e)}")
+
+
+def _process_standard_metrics(label, metrics, generated_metrics_script):
+    """Process standard-sized metrics."""
+    try:
+        _generate_metrics_with_retry(label, metrics, generated_metrics_script)
+    except Exception as e:
+        logger.error(f"Failed to process metrics for {label}: {str(e)}")
+
+
+def _generate_metrics_with_retry(label, metrics_data, output_list, chunk_info=""):
+    """Generate metrics with retry logic for rate limiting."""
+    max_retries = 3
+    retry_count = 0
+    backoff_time = 2  # Initial backoff in seconds
+    
+    while retry_count < max_retries:
+        try:
+            metrics_message = [
+                (
+                    "user",
+                    f'''
+                Generate Cypher queries to insert metrics into an existing Neo4j graph.
+
+                The metrics should be added as properties of the appropriate nodes that are already created in the graph.
+                Use the following syntax to update node properties:
+                  `MATCH (n:LABEL {{id: VALUE}} {{n.system=`system_name`}}) SET n.PROPERTY = METRIC_VALUE`
+                Example: Given the metric node_cpu_frequency_max_hertz{{cpu="0"}} 3.1e+09, update the node with label CPU and id: "0" by setting max_hertz = 3.1e+09.
+                Each key-value pair inside {{}} must be set as an individual property. Do not treat them as a single map.
+                If a metric has multiple attributes (e.g., node_network_info{{address="02:42:db:56:1c:74", adminstate="up"}}), split them into separate properties like
+                  `MATCH (n:Network {{n.system=`system_name`}}) SET n.address = "02:42:db:56:1c:74", n.adminstate = "up"`    
+                **Rules to follow:**
+                - Never use maps or JSON-like structures in Cypher queries. Each attribute must be a separate property.
+                - **Do not use `WITH` or `UNWIND` statements.**
+                - **Ensure every `MATCH` query ends with `;`** before generating the next one.
+                - **Batch updates:** If multiple properties are set for the same node, use a **single `MATCH` statement** and multiple `SET` clauses.
+                - Do not approximate values—use the exact values provided.
+                - Never return anything; no `RETURN` statements.
+                - Use the name or id of the NODENAME node to match the correct nodes. Every node has a property that represents the system it's part of.
+
+                Existing Nodes:
+                {nodes_cypher}
+
+                Metrics to Convert:
+                {metrics_data}
+                '''
+                )
+            ]
+            
+            logger.info(f'----GENERATING METRICS: {label} {chunk_info}----')
+            gen_metrics = metrics_gen_chain.invoke({'messages': metrics_message})
+            
+            if gen_metrics and gen_metrics.cypher_script:
+                output_list.append(gen_metrics.cypher_script.replace('\n', ''))
+                return  # Success, exit the retry loop
+            
+            # If we got an empty response but no exception, log and try again
+            logger.warning(f"Empty metrics response for {label} {chunk_info}, retrying...")
+            retry_count += 1
+            time.sleep(backoff_time)
+            backoff_time *= 2
+            
+        except Exception as e:
+            if hasattr(e, 'status_code') and e.status_code == 429:
+                # Rate limit hit, back off and retry
+                retry_count += 1
+                logger.warning(f"Rate limit hit (429) for {label} {chunk_info}. Retry {retry_count}/{max_retries}. Waiting {backoff_time}s")
+                time.sleep(backoff_time)
+                backoff_time *= 2  # Exponential backoff
+            else:
+                # Log other exceptions and reraise
+                logger.error(f"Error generating metrics for {label} {chunk_info}: {str(e)}")
+                raise
+    
+    # If all retries failed
+    logger.error(f"All retries failed for {label} {chunk_info}")
+    raise Exception(f"Failed to generate metrics for {label} after {max_retries} attempts")
   
 def reflect(state: GraphState): #TODO might need to be refactored; the if statement is not needed
   messages = state['messages']

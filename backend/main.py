@@ -15,6 +15,7 @@ from file_manager import encode_file
 logger = logging.getLogger(__name__)
 logging.basicConfig(filename='logs.log', encoding='utf-8', level=logging.INFO)
 
+scheduler = BackgroundScheduler()
 seen_files: Set[str] = set()
 
 def check_for_new_files():
@@ -34,8 +35,7 @@ def check_for_new_files():
 
 @asynccontextmanager
 async def lifespan(app:FastAPI):
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(check_for_new_files, 'interval', seconds=10) 
+    scheduler.add_job(check_for_new_files, 'interval', seconds=20, id="file-manager") 
     scheduler.start()
     yield
     scheduler.shutdown()   
@@ -99,11 +99,15 @@ async def query_graph(query: Message):
 async def get_node_ips():
     dr = './uploads'
     node_ids = set()
+    node_data = {}
     for f in os.listdir(dr):
         node_id = f.split('_')[0]
+        node_timestamp = f.split('_')[2].split('.')[0] # get the timestamp
         print(node_id)
+        print(node_timestamp)
         node_ids.add(node_id)
-    return node_ids
+        node_data[node_id] = node_timestamp
+    return node_data
         
 @app.get('/get-current-graph')
 async def get_current_graph():
@@ -126,6 +130,7 @@ async def get_current_graph():
 
 @app.post('/start-update')
 async def start_update(node_to_update: UpdateSystemNode):
+    scheduler.pause_job("file-manager")
     await AgentInterface().start_update(node_to_update.ip, node_to_update.name, node_to_update.timestamp)
 
 @app.get('/start-processing')
