@@ -49,3 +49,5 @@ class GraphState(TypedDict):
   iterations : int
   script: SystemCypherScript
   traceback: bool = False
+  
+  

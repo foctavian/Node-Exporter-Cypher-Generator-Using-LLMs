@@ -592,8 +592,6 @@ async def infer_missing_metrics(state: GraphState):
   missing_props = []
   chunks = chunk_metrics(file_text)
   
-  
-  #TEST ASYNC
   for chunk in chunks:
     prompt = f'''
         Infer the properties of the nodes based on the provided metrics. Use the provided schema to determine existing properties and nodes.

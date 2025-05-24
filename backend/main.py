@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, UploadFile, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 import os
 from contextlib import asynccontextmanager
@@ -11,12 +11,35 @@ import logging
 from apscheduler.schedulers.background import BackgroundScheduler
 from typing import Set 
 from file_manager import encode_file
+import asyncio 
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(filename='logs.log', encoding='utf-8', level=logging.INFO)
 
 scheduler = BackgroundScheduler()
+main_event_loop=None
 seen_files: Set[str] = set()
+connected_clients=set()
+
+async def async_broadcast_message(message: str):
+    disconnected = []
+    for client in connected_clients:
+        try:
+            await client.send_text(message)
+        except Exception as e:
+            disconnected.append(client)
+    
+    for client in disconnected:
+        connected_clients.remove(client)
+        
+def broadcast_message(message: str):
+    global main_event_loop
+    if main_event_loop:
+        asyncio.run_coroutine_threadsafe(
+            async_broadcast_message(message), main_event_loop
+        )
+
+#TODO move the processed files to a new directory
 
 def check_for_new_files():
     global seen_files
@@ -27,14 +50,18 @@ def check_for_new_files():
         if new_files:
             print(f"New files detected: {new_files}")
             for f in new_files:
-                encode_file(os.path.join(dr, f)) 
-        seen_files = current_files
+                nf=encode_file(os.path.join(dr, f))
+                if nf:
+                    broadcast_message(f"New file: {nf}") 
+                seen_files.add(nf)
     except Exception as e:
         print(e)
  
 
 @asynccontextmanager
 async def lifespan(app:FastAPI):
+    global main_event_loop
+    main_event_loop = asyncio.get_running_loop()
     scheduler.add_job(check_for_new_files, 'interval', seconds=20, id="file-manager") 
     scheduler.start()
     yield
@@ -64,6 +91,16 @@ app.add_middleware(
 @app.get("/")
 async def root():
     return {"message": "Hello World"}
+
+@app.websocket("/ws/notif")
+async def notification_endpoint(websocket:WebSocket):
+    await websocket.accept()
+    connected_clients.add(websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except Exception as e:
+        print(e)
 
 @app.post("/upload")
 async def upload_metrics_file(file:UploadFile=File(...)):
@@ -105,8 +142,6 @@ async def get_node_ips():
     for f in os.listdir(dr):
         node_id = f.split('_')[0]
         node_timestamp = f.split('_')[2].split('.')[0] # get the timestamp
-        print(node_id)
-        print(node_timestamp)
         node_ids.add(node_id)
         node_data[node_id] = node_timestamp
     return node_data

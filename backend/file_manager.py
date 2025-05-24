@@ -46,4 +46,5 @@ def encode_file(filename):
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d;%H:%M:%S.%f")
         new_filename = path.join(dr,enc_nodename+'_'+enc_filename+'_'+str(timestamp)+'.txt')
         rename(filename, new_filename)
+        return new_filename
 # use the name of the nodename and the name of the file as it comes and than hash it => unique IP separated by a _
