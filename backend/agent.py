@@ -1,6 +1,7 @@
 from collections import defaultdict
 import os
 import shutil
+from tenacity import retry, stop_after_attempt, wait_exponential
 from neo4j import GraphDatabase
 from langchain_mistralai import ChatMistralAI
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
@@ -318,19 +319,20 @@ def cypher_check(state: GraphState):
 
   if relationships:
     # then validate the relationships script
-    valid_rel, msg_rel = cypher_validation(relationships)
-    if not valid_rel: # relationship script is invalid
-      logger.warning(f'----RELATIONSHIP SCRIPT VALIDATION: FAILED : {msg_rel}----')
-      error_message = [("user", f"Relationship script is invalid: {msg_rel}")]
-      messages += error_message
-      return {'error':f'yes:relationships:{msg_rel}', 'messages':messages, 'iterations':state['iterations'], 'script':solution, 'traceback':True}
-    else:
-      logger.info(f'----RELATIONSHIP SCRIPT VALIDATION: SUCCESS----')
+    # valid_rel, msg_rel = cypher_validation(relationships)
+    # if not valid_rel: # relationship script is invalid
+    #   logger.warning(f'----RELATIONSHIP SCRIPT VALIDATION: FAILED : {msg_rel}----')
+    #   error_message = [("user", f"Relationship script is invalid: {msg_rel}")]
+    #   messages += error_message
+    #   return {'error':f'yes:relationships:{msg_rel}', 'messages':messages, 'iterations':state['iterations'], 'script':solution, 'traceback':True}
+    # else:
+    #   logger.info(f'----RELATIONSHIP SCRIPT VALIDATION: SUCCESS----')
+    relationship_list_query = split_query_on_semicolon(relationships)
   
   if properties:
     # then validate the properties script
     property_list_query = split_query_on_semicolon(properties) # the query needs to be split to be checked individually
-    wrong_queries = []
+  wrong_queries = []
  
   logger.info(f'----PROPERTIES SCRIPT VALIDATION: SUCCESS----')
   logger.info('----CYPHER SCRIPTS VALIDATION: SUCCESS----')
@@ -338,7 +340,12 @@ def cypher_check(state: GraphState):
   if nodes:
     run_cypher_query(nodes)
   if relationships:
-    run_cypher_query(relationships)
+    for q in relationship_list_query:
+      try:
+        if q == '': continue
+        run_cypher_query(q)
+      except Exception:
+        wrong_queries.append(q)
   if properties:
     for q in property_list_query:
       try:
@@ -550,8 +557,8 @@ def generate_node_update_script(state:GraphState): # TODO route this to the exis
     For **each** node, use the following pattern:
     ```
     MERGE (var:Label {{system: "system_name", name: "node_name"}})
-    ON CREATE SET var.createdAt = timestamp()
-    ON MATCH SET var.updatedAt = timestamp()
+    ON CREATE SET var.createdAt = datetime()
+    ON MATCH SET var.updatedAt = datetime()
     ```
 
     - Variable names should follow the format: `label_idOrName` (e.g., `cpu_0`)
@@ -639,49 +646,76 @@ async def infer_missing_metrics(state: GraphState):
   
 
 def generate_metric_update_script(state: GraphState):
-  logger.info(f'GENERATING METRICS UPDATE SCRIPT : {len(missing_props_dict)}')
-  script = state['script']
-  script['properties'] = ''
-  def chunk_generator(lst, chunk_size):
-    for i in range(0, len(lst), chunk_size):
-        yield lst[i:i + chunk_size]
-  
-  chunk_size = 100
-  
-  for chunk in chunk_generator(missing_props_dict, chunk_size):
-    question = ChatPromptTemplate([
-        ('user',
-        f"""
-        Convert the following properties into Cypher `MERGE`-based update statements for existing nodes.  
-        Each node is uniquely identified by its `label`, `name`, and `system`.
-
-        Instructions:
-        1. Use `MATCH` to locate the node by its `label`, filtering by both `name` and `system` properties.
-        2. Use `SET` to update the specified properties on the matched node.
-        3. Include `n.updatedAt = timestamp()` in every `SET` clause.
-        4. Output **only** the final Cypher code — do not include comments or explanations.
-        5. Do **not** include any `RETURN` statements.
-        6. Follow this exact pattern for each node:
-
-        MATCH (n:Label {{name: "node_name", system: "system_name"}})
-        SET n.property = value, n.updatedAt = timestamp()
-
-
-        Context:
-        The graph models a computation unit composed of multiple components.
-
-        Input:
-        {chunk}
-      """
-        )
-    ]
-    )
-    solution = metrics_gen_chain.invoke({
-        "messages":question
-    })  
-    script['properties'] += solution.cypher_script
-  logger.info(f'----GENERATED UPDATED METRICS: {script['properties']}----')
-  return {'script':script, **state}
+    logger.info(f'GENERATING METRICS UPDATE SCRIPT : {len(missing_props_dict)}')
+    script = state['script']
+    script['properties'] = ''
+    
+    def chunk_generator(lst, chunk_size):
+        for i in range(0, len(lst), chunk_size):
+            yield lst[i:i + chunk_size]
+    
+    def process_chunk_with_retry(chunk, max_retries=3, delay=1):
+        """Process a single chunk with retry logic and timeout handling"""
+        for attempt in range(max_retries):
+            try:
+                question = ChatPromptTemplate([
+                    ('user',
+                    f"""
+                    Convert the following properties into Cypher `MERGE`-based update statements for existing nodes.  
+                    Each node is uniquely identified by its `label`, `name`, and `system`.
+                    Instructions:
+                    1. Use `MATCH` to locate the node by its `label`, filtering by both `name` and `system` properties.
+                    2. Use `SET` to update the specified properties on the matched node.
+                    3. Include `n.updatedAt = timestamp()` in every `SET` clause.
+                    4. Output **only** the final Cypher code — do not include comments or explanations.
+                    5. Do **not** include any `RETURN` statements.
+                    6. Follow this exact pattern for each node:
+                    MATCH (n:Label {{name: "node_name", system: "system_name"}})
+                    SET n.property = value, n.updatedAt = timestamp()
+                    Context:
+                    The graph models a computation unit composed of multiple components.
+                    Input:
+                    {chunk}
+                    """
+                    )
+                ])
+                
+                # Add timeout to the chain invocation
+                solution = metrics_gen_chain.invoke(
+                    {"messages": question},
+                    config={"timeout": 30}  # 30 second timeout per chunk
+                )
+                return solution.cypher_script
+                
+            except Exception as e:
+                logger.warning(f"Attempt {attempt + 1} failed for chunk: {str(e)}")
+                if attempt < max_retries - 1:
+                    time.sleep(delay * (attempt + 1))  # Exponential backoff
+                else:
+                    logger.error(f"Failed to process chunk after {max_retries} attempts: {chunk}")
+                    return ""  # Return empty string for failed chunks
+    
+    chunk_size = 30
+    chunks = list(chunk_generator(missing_props_dict, chunk_size))
+    
+    # Option 1: Sequential processing with delays (safer)
+    cypher_parts = []
+    for i, chunk in enumerate(chunks):
+        logger.info(f"Processing chunk {i+1}/{len(chunks)}")
+        
+        result = process_chunk_with_retry(chunk)
+        if result:
+            cypher_parts.append(result)
+        
+        # Add delay between chunks to prevent timeout
+        if i < len(chunks) - 1:  # Don't delay after the last chunk
+            time.sleep(2)  # 2 second delay between chunks
+    
+    # Join all successful results
+    script['properties'] = '\n'.join(cypher_parts)
+    
+    logger.info(f'----GENERATED UPDATED METRICS: {len(script["properties"])} characters----')
+    return {'script': script, **state}
 
 def generate_rel_update_script(state: GraphState):
   question = ChatPromptTemplate([
@@ -1040,7 +1074,7 @@ def reflect(state: GraphState): #TODO might need to be refactored; the if statem
   messages = state['messages']
   iterations = state['iterations']
   error = state['error']
-  solution = state['generation']
+  # solution = state['generation']
   traceback = state['traceback']
   script = state['script']
   logger.info(f"----ENTERED REFLECT: {'yes' in error}----")
@@ -1065,7 +1099,7 @@ def reflect(state: GraphState): #TODO might need to be refactored; the if statem
     logger.warning(f'----REFLECTIONS: {solution}----')
     if solution:
       script['properties'] = solution.cypher_script
-    return {'error':error, 'messages':messages, 'iterations':iterations, 'generation':solution, 'script':script, 'traceback':traceback}
+    return {'error':script,**state}
 
 def check_traceback_reflect_error(state: GraphState):
   return state['traceback']
