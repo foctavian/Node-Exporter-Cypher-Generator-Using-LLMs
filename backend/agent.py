@@ -289,6 +289,35 @@ def chunk_file(text):
   texts = text_splitter.split_text(text)
   print(texts[0])
   
+  
+async def check_inferred_nodes_existence(state:GraphState):
+  confirmed_missing = {}
+  logger.info("----CHECKING MISSING NODES----")
+
+  for label, nodes in missing_nodes_dict.items():
+    items = [{'name': node.name, 'system': node.system} for node in nodes]
+    existing_map = _batch_node_exists(label, items)
+    confirmed_missing[label]=[node for node in nodes if not existing_map.get((node.name, node.system), False)]
+    logger.info(f"----CONFIRMED MISSING NODES: {confirmed_missing}")
+  return {'confirmed_missing_nodes':confirmed_missing, **state}
+    
+def _batch_node_exists(label, items):
+    """
+    items: List of dicts like [{'name': 'NVIDIA-GTX-1080', 'system': 'system1'}, ...]
+    Returns: dict {(name, system): exists}
+    """
+    query = f"""
+    UNWIND $items AS item
+    OPTIONAL MATCH (n:{label} {{name: item.name, system: item.system}})
+    RETURN item.name AS name, item.system AS system, COUNT(n) > 0 AS exists
+    """
+    with driver.session() as session:
+        result = session.run(query, items=items)
+        return {
+            (record["name"], record["system"]): record["exists"]
+            for record in result
+        }
+      
 
 ##################################### AGENT WORKFLOW ########################################
 max_iterations = 5
@@ -381,6 +410,10 @@ async def existing_node(state: GraphState):
     logger.info(f'RECORDS: {records}')
     logger.warning(f'query: {query}')
     logger.warning(f'Node already exists: {already_existing_node}')
+    
+def has_nodes_to_add(state: GraphState) -> bool:
+    if state['confirmed_missing_nodes']:
+      return any(state['confirmed_missing_nodes'].values())
 
 def node_gen(state: GraphState) -> GraphState:
   global processed_components
@@ -400,8 +433,7 @@ def node_gen(state: GraphState) -> GraphState:
       Do not use special characters such as `-` in variable names.
       
       For context, the  graph represents a computation unit with various hardware components.
-      Because of that, I need you to add a property to each node that represents the system it is part of. For example, any node should have a property `system:"edge2-System-Product-Name"` where the value is the name of the system, represented by the node with label `NODENAME`.
-      For the `NODENAME` node, do not insert a system property.
+      Add a property `system: "{processed_components['NODENAME'][0]}"` to every node **except** the `NODENAME` node.
       Do not return any values in the final query.
       For every node include their name as a property. For example, the `CPU` node with id `0` should have a property `name: "0"`. 
       
@@ -437,7 +469,7 @@ async def infer_missing_nodes(state: GraphState):
                 As a rule of thumb, if the type represents a physical components, you can take it into consideration.
                 Do not abbreviate the name of the label.
                 Return **only** the nodes that are **not present** in the schema.
-                There could be some false positives, so be careful when inferring the nodes. The schema has CPU nodes so a PROCESSOR node is not needed.
+                There could be some false positives, so be careful when inferring the nodes. The schema has CPU label so PROCESSOR is not needed. 
                 Before you add the node, check if it is already present in the graph.
                 
                 Instructions:
@@ -666,12 +698,12 @@ def generate_metric_update_script(state: GraphState):
                     Instructions:
                     1. Use `MATCH` to locate the node by its `label`, filtering by both `name` and `system` properties.
                     2. Use `SET` to update the specified properties on the matched node.
-                    3. Include `n.updatedAt = timestamp()` in every `SET` clause.
+                    3. Include `n.updatedAt = datetime()` in every `SET` clause.
                     4. Output **only** the final Cypher code — do not include comments or explanations.
                     5. Do **not** include any `RETURN` statements.
                     6. Follow this exact pattern for each node:
                     MATCH (n:Label {{name: "node_name", system: "system_name"}})
-                    SET n.property = value, n.updatedAt = timestamp()
+                    SET n.property = value, n.updatedAt = datetime();
                     Context:
                     The graph models a computation unit composed of multiple components.
                     Input:
@@ -715,6 +747,7 @@ def generate_metric_update_script(state: GraphState):
     script['properties'] = '\n'.join(cypher_parts)
     
     logger.info(f'----GENERATED UPDATED METRICS: {len(script["properties"])} characters----')
+    logger.info(f'----GENERATED METRICS UPDATE SCRIPT: \n {script["properties"]}----')
     return {'script': script, **state}
 
 def generate_rel_update_script(state: GraphState):
@@ -1018,11 +1051,11 @@ def _generate_metrics_with_retry(label, metrics_data, output_list, chunk_info=""
 
                 The metrics should be added as properties of the appropriate nodes that are already created in the graph.
                 Use the following syntax to update node properties:
-                  `MATCH (n:LABEL {{id: VALUE}} {{n.system=`system_name`}}) SET n.PROPERTY = METRIC_VALUE`
+                  `MATCH (n:LABEL {{id: VALUE}} {{system:`system_name`}}) SET n.PROPERTY = METRIC_VALUE`
                 Example: Given the metric node_cpu_frequency_max_hertz{{cpu="0"}} 3.1e+09, update the node with label CPU and id: "0" by setting max_hertz = 3.1e+09.
                 Each key-value pair inside {{}} must be set as an individual property. Do not treat them as a single map.
                 If a metric has multiple attributes (e.g., node_network_info{{address="02:42:db:56:1c:74", adminstate="up"}}), split them into separate properties like
-                  `MATCH (n:Network {{n.system=`system_name`}}) SET n.address = "02:42:db:56:1c:74", n.adminstate = "up"`    
+                  `MATCH (n:Network {{system=:system_name`}}) SET n.address = "02:42:db:56:1c:74", n.adminstate = "up"`    
                 **Rules to follow:**
                 - Never use maps or JSON-like structures in Cypher queries. Each attribute must be a separate property.
                 - **Do not use `WITH` or `UNWIND` statements.**
@@ -1098,7 +1131,7 @@ def reflect(state: GraphState): #TODO might need to be refactored; the if statem
     traceback=True
     logger.warning(f'----REFLECTIONS: {solution}----')
     if solution:
-      script['properties'] = solution.cypher_script
+      script[err_cause] = solution.cypher_script
     return {'error':script,**state}
 
 def check_traceback_reflect_error(state: GraphState):
@@ -1134,6 +1167,7 @@ def inititialize_graph():
     workflow.add_node('metrics_gen', metrics_gen)
     workflow.add_node('cypher_check', cypher_check)
     workflow.add_node('reflect', reflect)
+    workflow.add_node('inferred_node_existence', check_inferred_nodes_existence)
 
     workflow.add_node('infer_node', infer_missing_nodes) # go to node_gen if there are missing nodes, else generate only the metrics
     workflow.add_node('update_node', generate_node_update_script) 
@@ -1146,7 +1180,12 @@ def inititialize_graph():
     workflow.add_conditional_edges('node_existance', check_existing_node, {True: 'infer_node', False: 'node_gen'}) # checks if the node already exists
     workflow.add_edge('metrics_gen', 'cypher_check')
     
-    workflow.add_edge('infer_node', 'update_node') 
+    # workflow.add_edge('infer_node', 'update_node')
+    workflow.add_edge('infer_node', 'inferred_node_existence')
+    workflow.add_conditional_edges('inferred_node_existence', has_nodes_to_add, {
+    True: 'update_node',
+    False: 'infer_relationship' 
+    })
     workflow.add_edge('update_node', 'infer_relationship') 
     workflow.add_edge('infer_relationship', 'update_relationship') 
     workflow.add_edge('update_relationship', "infer_metrics") 
