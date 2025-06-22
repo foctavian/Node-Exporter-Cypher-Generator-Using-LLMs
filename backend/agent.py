@@ -26,13 +26,32 @@ from models import *
 from datetime import datetime, timezone
 from fastapi import HTTPException
 import time
+
+ws_formatter = logging.Formatter('%(asctime)s - %(message)s')
+debug_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+
+ws_handler = logging.FileHandler('ws.log')
+ws_handler.setLevel(logging.INFO)
+ws_handler.setFormatter(ws_formatter)
+
+debug_handler = logging.FileHandler('debug.log')
+debug_handler.setLevel(logging.DEBUG)
+debug_handler.setFormatter(debug_formatter)
+
 logger = logging.getLogger(__name__)
-logging.basicConfig(filename='logs.log', level=logging.INFO)
+logger.setLevel(logging.DEBUG) 
+logger.addHandler(ws_handler)
+logger.addHandler(debug_handler)
 
 ############################## GLOBAL VARIABLES ############################
 load_dotenv()
 tokenizer = MistralTokenizer.v3()
-mistral_model = "codestral-latest"
+
+# mistral-small-2503
+# mistral-medium-2505
+# codestral-2501
+
+mistral_model = "codestral-2501"
 llm = ChatMistralAI(model = mistral_model,
                     temperature = 0,
                     max_tokens=20000,
@@ -300,24 +319,84 @@ async def check_inferred_nodes_existence(state:GraphState):
     confirmed_missing[label]=[node for node in nodes if not existing_map.get((node.name, node.system), False)]
     logger.info(f"----CONFIRMED MISSING NODES: {confirmed_missing}")
   return {'confirmed_missing_nodes':confirmed_missing, **state}
+
+async def check_inferred_relationships_existence(state:GraphState):
+  logger.info("----CHECKING MISSING RELATIONSHIPS----")
+  
+  if not missing_rels_dict:
+    return {'confirmed_missing_rels':[], **state}
+  
+  items=[]
+  for rel in missing_rels_dict:
+    source = rel.source
+    target = rel.target
+    relationship = rel.relationship
+    items.append({
+      'source': {'name': source.name, 'system': source.system, 'label': source.label},
+      'target': {'name': target.name, 'system': target.system, 'label': target.label},
+      'relationship': relationship
+    })
+
+  confirmed_missing_rels = _batch_rel_exists(items)
+  logger.info(f"----CONFIRMED MISSING RELATONSHIPS: {confirmed_missing_rels}")
+  return {'confirmed_missing_rels':confirmed_missing_rels, **state}
     
 def _batch_node_exists(label, items):
     """
     items: List of dicts like [{'name': 'NVIDIA-GTX-1080', 'system': 'system1'}, ...]
     Returns: dict {(name, system): exists}
     """
-    query = f"""
-    UNWIND $items AS item
-    OPTIONAL MATCH (n:{label} {{name: item.name, system: item.system}})
-    RETURN item.name AS name, item.system AS system, COUNT(n) > 0 AS exists
-    """
+    if label == "NODENAME":
+      query = f"""
+      UNWIND $items AS item
+      OPTIONAL MATCH (n {{name: item.name}})
+      RETURN item.name AS name, '' AS system, COUNT(n) > 0 AS exists
+      """
+      key_func = lambda record: (record["name"], "")
+    else:
+      query = f"""
+      UNWIND $items AS item
+      OPTIONAL MATCH (n {{name: item.name, system: item.system}})
+      RETURN item.name AS name, item.system AS system, COUNT(n) > 0 AS exists
+      """
+      key_func = lambda record: (record["name"], record["system"])
     with driver.session() as session:
-        result = session.run(query, items=items)
-        return {
-            (record["name"], record["system"]): record["exists"]
-            for record in result
-        }
-      
+      logger.info(f"{query}")
+      result = session.run(query, items=items)
+      return {
+        key_func(record): record["exists"]
+        for record in result
+      }
+
+def _batch_rel_exists(items):
+  missing_rels=[]
+  for item in items:
+    source = item['source']
+    target=item['target']
+    relationship=item['relationship']
+    
+    source_match = f"(s:{source['label']} {{name: \"{source['name']}\""
+    if source['label'] != "NODENAME":
+        source_match += f", system: \"{source['system']}\""
+    source_match += "})"
+    
+    target_match = f"(t:{target['label']} {{name: \"{target['name']}\""
+    if target['label'] != "NODENAME":
+        target_match +=f", system: \"{target['system']}\""
+    target_match += "})"
+    
+    query=f'''
+    OPTIONAL MATCH {source_match}, {target_match} 
+    RETURN EXISTS((s)-[:{relationship}]-(t)) as exists
+    '''
+    
+    with driver.session() as session:
+      logger.info(f"{query}")
+      result = session.run(query)
+      exists = result.single()["exists"]
+      if not exists:
+        missing_rels.append(item)
+  return missing_rels
 
 ##################################### AGENT WORKFLOW ########################################
 max_iterations = 5
@@ -382,7 +461,7 @@ def cypher_check(state: GraphState):
         run_cypher_query(q)
       except Exception:
         wrong_queries.append(q)
-    logger.warning(f"---WRONG QUERIES: {wrong_queries}")
+    logger.debug(f"---WRONG QUERIES: {wrong_queries}")
     if len(wrong_queries)>0:
       return {'error':f'yes:properties:{wrong_queries}', 'messages':messages, 'iterations':state['iterations'], 'script':solution, 'traceback':True}
           
@@ -407,23 +486,28 @@ async def existing_node(state: GraphState):
         already_existing_node = True
       else:
         already_existing_node=False
-    logger.info(f'RECORDS: {records}')
-    logger.warning(f'query: {query}')
-    logger.warning(f'Node already exists: {already_existing_node}')
+    logger.debug(f'RECORDS: {records}')
+    logger.debug(f'query: {query}')
+    logger.info(f'Node already exists: {already_existing_node}')
     
 def has_nodes_to_add(state: GraphState) -> bool:
     if state['confirmed_missing_nodes']:
       return any(state['confirmed_missing_nodes'].values())
 
+def has_rels_to_add(state: GraphState) -> bool:
+  if state['confirmed_missing_rels']:
+    return len(state['confirmed_missing_rels']) > 0
+
 def node_gen(state: GraphState) -> GraphState:
   global processed_components
+  import time
   logger.info('----GENERATING COMPONENTS----')
   messages = state['messages']
   iterations = state['iterations']
   error = state['error']
   script = state['script']
   traceback = state['traceback']
-  
+  start = time.time()
   question = ChatPromptTemplate([
     'user',
     f'''
@@ -447,6 +531,8 @@ def node_gen(state: GraphState) -> GraphState:
   
   script['nodes'] = solution.cypher_script
   logger.info(f'----GENERATED NODES: {solution.cypher_script}----')
+  end = time.time()
+  logger.info(f'----NODE GENERATION TOOK {end-start:.4f} seconds.')
   return {'generation':solution, "messages" : messages, "iterations" : iterations, "script": script, 'traceback':traceback}
 
 async def infer_missing_nodes(state: GraphState):
@@ -461,7 +547,6 @@ async def infer_missing_nodes(state: GraphState):
   chunks =  chunk_metrics(file_text)
   all_messages = []
   all_responses = []
-  # TEST ASYNC
   for chunk in chunks :
     prompt = f'''
                 Extract only the name and type of nodes from the metrics. Use the provided schema to determine existing nodes.
@@ -485,12 +570,13 @@ async def infer_missing_nodes(state: GraphState):
                 5. Do not return existing nodes.
                 6. There is only one NODENAME node: {processed_components['NODENAME'][0]}.
                 7. Exclude providing any explanations or comments in the output.
-                8. For reference, this is the graph schema: {graph.schema}
+                8. For reference, this is the graph schema: {graph.schema}.
+                9. Assume the system identifier is: {processed_components['NODENAME'][0]}.
                 Ensure that nodes are compared strictly by both **name** and **type** before determining if they are missing.
             '''
     all_messages.append(prompt)
     
-  concurrent_batch_size = 3
+  concurrent_batch_size = 7
   start_time = time.time()
   
   for i in range(0, len(all_messages), concurrent_batch_size):
@@ -512,8 +598,8 @@ async def infer_missing_nodes(state: GraphState):
           logger.error(f"Failed individual request: {inner_e}")
   
   end_time = time.time()      
-  logger.warning(f"Batch processing took {end_time - start_time:.2f} seconds.")
-  logger.warning(f"{all_responses}")
+  logger.debug(f"Batch processing took {end_time - start_time:.2f} seconds.")
+  logger.debug(f"{all_responses}")
 
   for response in all_responses:
     for node in response.nodes:
@@ -524,12 +610,14 @@ async def infer_missing_nodes(state: GraphState):
         if node not in missing_nodes_dict[label]:
           missing_nodes_dict[label].append(node)
   logger.info(f'----INFERRED NODES: {missing_nodes_dict}----')
+  logger.info(f'INFERRED NODES NO.: {len(missing_nodes_dict)}')
   return {**state}
 
 #TODO add a check to see if the node or relationship is already present in the graph  
 
-def infer_missing_relationships(state: GraphState):
+async def infer_missing_relationships(state: GraphState):
   import time
+  import asyncio
   logger.info('----INFERRING MISSING RELATIONSHIPS----')
   global file_text
   global missing_rels_dict
@@ -537,10 +625,11 @@ def infer_missing_relationships(state: GraphState):
   chunks = chunk_metrics(file_text)
   time.sleep(1)
   # use the chunk to infer the missing nodes
-  messages = [
-      (
-          "user",
-          f'''
+  all_messages = []
+  all_responses = []
+  
+  for chunk in chunks:
+    prompt = f'''
           Infer the relationships between the nodes based on the provided metrics. Use the provided schema to determine existing relationships.
           These are the nodes that were previously inferred: 
           {state['script']['nodes']}
@@ -548,38 +637,57 @@ def infer_missing_relationships(state: GraphState):
           {graph.schema}
           
           Steps:
-          1. Parse the created nodes to extract the missing relationships.
+          1. Parse the created nodes and the provided chunk to extract the missing relationships.
           2. Compare these against the provided schema (`{graph.schema}`).
           3. Return a **list of missing relationships**. If all relationships exist, return an **empty list**.
           4. Do not return existing relationships.
           5. The relationship should be in the format: `HAS_*`. 
           6. The only node that should not have a system property is the `NODENAME` node. Insert an empty string for the system property.
           
+          Chunk:
+          {chunk}
+          
           '''
-      )
-  ]
-  text = "".join([content for _, content in messages])
-  logger.info(f'----Message size: {len(text)}----')
-    
-  solution = relationships_inferring_chain.invoke({
-        "messages":messages
-    })
-  if not solution:
-    logger.info('----NO MISSING RELATIONSHIPS----')
-    messages += [
-        ('assistant', 'NO MISSING RELATIONSHIPS')
-    ]
-  else:
-    logger.info(f'----INFERRED RELATIONSHIPS: {solution.relationships}----')
-    messages += [
-        ('assistant', f"INFERRED RELATIONSHIPS: {solution.relationships}")
-    ]
-    missing_relationships += solution.relationships
-  missing_rels_dict=missing_relationships
+    all_messages.append(prompt)
+  
+  concurrent_batch_size = 7 
+  start_time = time.time()
+  
+  for i in range(0, len(all_messages), concurrent_batch_size):
+    batch = all_messages[i:i+concurrent_batch_size]
+    try:
+      batch_responses = await relationships_inferring_chain.abatch(batch)
+      all_responses.extend(batch_responses)
+      if i+concurrent_batch_size < len(all_messages):
+        await asyncio.sleep(1)
+    except Exception as e:
+        logger.error(f"Error processing batch {i//concurrent_batch_size}: {e}")
+        await asyncio.sleep(5)
+        for msg in batch:
+          try:
+            response = await relationships_inferring_chain.ainvoke(msg)
+            all_responses.append(response)
+            await asyncio.sleep(0.5)
+          except Exception as inner_e:
+            logger.error(f"Failed individual request: {inner_e}")
+  
+  end_time = time.time()
+  logger.debug(f"Batch processing took {end_time - start_time:.2f} seconds.")
+  logger.debug(f"{all_responses}")
+  
+  for res in all_responses:
+    logger.info(res)
+    if not res or not res.relationships:
+        logger.info("----NO MISSING RELATIONSHIPS IN CHUNK----")
+    else:
+        logger.debug(f"----INFERRED RELATIONSHIPS: {res.relationships}----")
+        missing_rels_dict.extend(res.relationships)
+
   return {**state}
   
 
 def generate_node_update_script(state:GraphState): # TODO route this to the existing node generation node
+  confirmed_missing_nodes = state['confirmed_missing_nodes']
   question = ChatPromptTemplate([
       ('user',
       f"""
@@ -595,7 +703,8 @@ def generate_node_update_script(state:GraphState): # TODO route this to the exis
 
     - Variable names should follow the format: `label_idOrName` (e.g., `cpu_0`)
     - Do not use special characters like `-` in variable names
-    - Add a property `system: "{processed_components['NODENAME'][0]}"` to every node **except** the `NODENAME` node
+    - For every node except the `NODENAME` node, include a property: `system: "{processed_components['NODENAME'][0]}"`.
+      This system property must include the full, unaltered string. Do not abreviate, truncate, or modify the value in any way.
     - Always include `name: "..."` as a property on the node
     - Do **not** return any output values in the final query
     - The `NODENAME` node should not have a system property
@@ -603,17 +712,18 @@ def generate_node_update_script(state:GraphState): # TODO route this to the exis
     For context, the graph represents a computation unit with various hardware components.
 
     Input:
-    {missing_nodes_dict}
+    {confirmed_missing_nodes} 
     """
       )
   ]
   )
   
+  #TODO split the dict based on the given context length
+  
   solution = cypher_gen_chain.invoke({
       "messages":question
   })
   
-  #solution.cypher_script = solution.cypher_script.replace('CREATE ', 'MERGE ')
   
   logger.info(f'----GENERATED UPDATED NODES: {solution.cypher_script}----')
   state['script']['nodes'] = solution.cypher_script
@@ -645,7 +755,7 @@ async def infer_missing_metrics(state: GraphState):
         3. Do not return existing properties.
     '''
     all_messages.append(prompt)
-  concurrent_batch_size = 3
+  concurrent_batch_size = 7
   start_time = time.time()
   for i in range(0, len(all_messages), concurrent_batch_size):
     batch = all_messages[i:i+concurrent_batch_size]
@@ -693,7 +803,8 @@ def generate_metric_update_script(state: GraphState):
                 question = ChatPromptTemplate([
                     ('user',
                     f"""
-                    Convert the following properties into Cypher `MERGE`-based update statements for existing nodes.  
+                    Convert the following properties into Cypher `MERGE`-based update statements for existing nodes.
+                    Each property is uniquely identfied by its `name`, `value` and `node`.  
                     Each node is uniquely identified by its `label`, `name`, and `system`.
                     Instructions:
                     1. Use `MATCH` to locate the node by its `label`, filtering by both `name` and `system` properties.
@@ -704,7 +815,9 @@ def generate_metric_update_script(state: GraphState):
                     6. Follow this exact pattern for each node:
                     MATCH (n:Label {{name: "node_name", system: "system_name"}})
                     SET n.property = value, n.updatedAt = datetime();
-                    Context:
+                    
+                    Ensure the node label is not omitted or replaced by a generic placeholder.
+                    **Context**:
                     The graph models a computation unit composed of multiple components.
                     Input:
                     {chunk}
@@ -730,7 +843,6 @@ def generate_metric_update_script(state: GraphState):
     chunk_size = 30
     chunks = list(chunk_generator(missing_props_dict, chunk_size))
     
-    # Option 1: Sequential processing with delays (safer)
     cypher_parts = []
     for i, chunk in enumerate(chunks):
         logger.info(f"Processing chunk {i+1}/{len(chunks)}")
@@ -739,11 +851,10 @@ def generate_metric_update_script(state: GraphState):
         if result:
             cypher_parts.append(result)
         
-        # Add delay between chunks to prevent timeout
-        if i < len(chunks) - 1:  # Don't delay after the last chunk
-            time.sleep(2)  # 2 second delay between chunks
+        
+        if i < len(chunks) - 1: 
+            time.sleep(2)  
     
-    # Join all successful results
     script['properties'] = '\n'.join(cypher_parts)
     
     logger.info(f'----GENERATED UPDATED METRICS: {len(script["properties"])} characters----')
@@ -751,6 +862,7 @@ def generate_metric_update_script(state: GraphState):
     return {'script': script, **state}
 
 def generate_rel_update_script(state: GraphState):
+  confirmed_missing_rels = state['confirmed_missing_rels']
   question = ChatPromptTemplate([
       ('user',
       f"""
@@ -774,7 +886,7 @@ def generate_rel_update_script(state: GraphState):
       The graph represents a computing unit composed of interconnected hardware components (e.g., CPU, memory, GPU, sensors, etc.).
 
       Input:
-      {missing_rels_dict}
+      {confirmed_missing_rels}
     """
       )
   ]
@@ -833,6 +945,9 @@ def relationships_gen(state: GraphState):
   traceback = state['traceback']
   nodes = state['generation'].cypher_script
   nodes_cypher= ''.join(nodes)
+  
+  start=time.time()
+  
   rel_message= [
       (
           "user",
@@ -879,6 +994,9 @@ def relationships_gen(state: GraphState):
   script['relationships'] = relationships.cypher_script
   logger.info(f'----GENERATED RELATIONSHIPS: {relationships.cypher_script}----')
   #print("Generated relationships:", relationships)
+  end=time.time()
+  logger.info(f'----RELATIONSHIP GENERATION TOOK {end-start:.4f} seconds.')
+
   return {'generation':relationships,"messages" : messages, "iterations" : iterations, "script":script, 'traceback':traceback}
 
 def metrics_gen(state: GraphState):
@@ -900,7 +1018,7 @@ def metrics_gen(state: GraphState):
     script = state['script']
     traceback = state['traceback']
     generated_metrics_script = []
-    
+    start = time.time()
     # Handle existing errors
     if 'yes' in error:
         return _handle_error_regeneration(state)
@@ -933,7 +1051,9 @@ def metrics_gen(state: GraphState):
     # Create solution
     combined_metrics = ' '.join(generated_metrics_script)
     solution = cypher(problem='Metrics', cypher_script=combined_metrics)
-    
+    end=time.time()
+    logger.info(f'----PROPERTY GENERATION TOOK {end-start:.4f} seconds.')
+
     return {
         'generation': solution, 
         "messages": messages, 
@@ -1168,7 +1288,7 @@ def inititialize_graph():
     workflow.add_node('cypher_check', cypher_check)
     workflow.add_node('reflect', reflect)
     workflow.add_node('inferred_node_existence', check_inferred_nodes_existence)
-
+    workflow.add_node('inferred_rels_existence', check_inferred_relationships_existence)
     workflow.add_node('infer_node', infer_missing_nodes) # go to node_gen if there are missing nodes, else generate only the metrics
     workflow.add_node('update_node', generate_node_update_script) 
     workflow.add_node('infer_relationship', infer_missing_relationships)
@@ -1186,8 +1306,13 @@ def inititialize_graph():
     True: 'update_node',
     False: 'infer_relationship' 
     })
-    workflow.add_edge('update_node', 'infer_relationship') 
-    workflow.add_edge('infer_relationship', 'update_relationship') 
+    workflow.add_conditional_edges('inferred_rels_existence', has_rels_to_add, {
+    True: 'update_relationship',
+    False: 'infer_metrics' 
+    })
+    workflow.add_edge('update_node', 'infer_relationship')
+    workflow.add_edge('infer_relationship', 'inferred_rels_existence') 
+    # workflow.add_edge('infer_relationship', 'update_relationship') 
     workflow.add_edge('update_relationship', "infer_metrics") 
     workflow.add_edge('infer_metrics', 'update_metrics') 
     workflow.add_edge('update_metrics', 'cypher_check') 
@@ -1237,11 +1362,12 @@ def visualize_graph(app, output_file='graph.png'):
       print("Graph generation failed.")
 
 async def start_agent(filename='node_exporter_metrics.txt'):
+  import time
   parse_file(filename)
   global processed_components
   global metrics_component
   app = inititialize_graph()
-  #visualize_graph(app)
+  visualize_graph(app)
   logger.info('----STARTING AGENT----')
   question = ChatPromptTemplate([
       ('user',

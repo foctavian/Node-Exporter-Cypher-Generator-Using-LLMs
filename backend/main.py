@@ -12,6 +12,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from typing import Set 
 from file_manager import encode_file
 import asyncio 
+import json
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(filename='logs.log', encoding='utf-8', level=logging.INFO)
@@ -39,7 +40,76 @@ def broadcast_message(message: str):
             async_broadcast_message(message), main_event_loop
         )
 
-#TODO move the processed files to a new directory
+async def stream_log_file():
+    """Stream log file content to connected WebSocket clients"""
+    import aiofiles
+    log_path = './ws.log'
+    
+    # Wait for log file to exist or create it
+    if not os.path.exists(log_path):
+        try:
+            with open(log_path, 'w') as f:
+                f.write("")  # Create empty log file
+            logger.info(f"Created log file: {log_path}")
+        except Exception as e:
+            logger.error(f"Failed to create log file: {e}")
+            return
+    
+    try:
+        # Get initial file size
+        last_size = os.path.getsize(log_path) if os.path.exists(log_path) else 0
+        logger.info(f"Started streaming log file from position: {last_size}")
+        
+        while True:
+            try:
+                current_size = os.path.getsize(log_path)
+                
+                # Check if file has grown
+                if current_size > last_size:
+                    async with aiofiles.open(log_path, mode='r') as f:
+                        # Seek to last known position
+                        await f.seek(last_size)
+                        
+                        # Read all new content
+                        new_content = await f.read()
+                        if new_content:
+                            # Split by lines and process each
+                            lines = new_content.split('\n')
+                            for line in lines:
+                                line = line.strip()
+                                if line:  # Only send non-empty lines
+                                    message = json.dumps({
+                                        'type': "log", 
+                                        "message": line,
+                                        "timestamp": datetime.now().isoformat()
+                                    })
+                                    if connected_clients:  # Only broadcast if there are clients
+                                        await async_broadcast_message(message)
+                                        logger.debug(f"Broadcasted log line: {line[:50]}...")
+                        
+                        # Update last known size
+                        last_size = current_size
+                
+                # Handle file truncation/rotation
+                elif current_size < last_size:
+                    logger.info("Log file was truncated, resetting position")
+                    last_size = 0
+                
+                await asyncio.sleep(0.5)  # Check every 500ms
+                
+            except FileNotFoundError:
+                logger.warning("Log file not found, waiting...")
+                await asyncio.sleep(1)
+                last_size = 0
+            except Exception as e:
+                logger.error(f"Error reading log file: {e}")
+                await asyncio.sleep(2)
+                
+    except asyncio.CancelledError:
+        logger.info("Log streaming task cancelled")
+        raise
+    except Exception as e:
+        logger.error(f"Critical error in stream_log_file: {e}")
 
 def check_for_new_files():
     global seen_files
@@ -52,7 +122,7 @@ def check_for_new_files():
             for f in new_files:
                 nf=encode_file(os.path.join(dr, f))
                 if nf:
-                    broadcast_message(f"New file: {nf}") 
+                    broadcast_message(json.dumps({"type":"notification", "message":f"New file: {nf}"})) 
                 seen_files.add(nf)
     except Exception as e:
         print(e)
@@ -62,10 +132,13 @@ def check_for_new_files():
 async def lifespan(app:FastAPI):
     global main_event_loop
     main_event_loop = asyncio.get_running_loop()
-    scheduler.add_job(check_for_new_files, 'interval', seconds=20, id="file-manager") 
+    scheduler.add_job(check_for_new_files, 'interval', seconds=20, id="file-manager")
+    log_streaming_task = asyncio.create_task(stream_log_file())
     scheduler.start()
     yield
-    scheduler.shutdown()   
+    if log_streaming_task:
+        log_streaming_task.cancel()
+    scheduler.shutdown() 
     
 app = FastAPI(lifespan=lifespan)
 class Message(BaseModel):
@@ -92,7 +165,7 @@ app.add_middleware(
 async def root():
     return {"message": "Hello World"}
 
-@app.websocket("/ws/notif")
+@app.websocket("/ws")
 async def notification_endpoint(websocket:WebSocket):
     await websocket.accept()
     connected_clients.add(websocket)
@@ -101,6 +174,7 @@ async def notification_endpoint(websocket:WebSocket):
             await websocket.receive_text()
     except Exception as e:
         print(e)
+        
 
 @app.post("/upload")
 async def upload_metrics_file(file:UploadFile=File(...)):

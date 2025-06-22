@@ -50,5 +50,6 @@ class GraphState(TypedDict):
   script: SystemCypherScript
   traceback: bool = False
   confirmed_missing_nodes: dict = None
+  confirmed_missing_rels:dict = None
   
   

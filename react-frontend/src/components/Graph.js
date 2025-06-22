@@ -4,6 +4,7 @@ import { Network } from "vis-network";
 import { DataSet } from "vis-data";
 import "vis-network/styles/vis-network.css";
 import "../style/Graph.css";
+import { useWebSocket } from "./WebSocketContext";
 
 const Graph = () => {
   const graphContainerRef = useRef(null);
@@ -16,6 +17,11 @@ const Graph = () => {
   const [updateStatus, setUpdateStatus] = useState({});
   const [systems, setSystems] = useState([]);
 
+  const [isOpen, setIsOpen] = useState(false);
+
+  const { notifications } = useWebSocket();
+  const {logs} = useWebSocket();
+  const [visibleNotification, setVisibleNotification] = useState(null);
   const initSystems = (nodesObj) => {
     const newSystems = Object.entries(nodesObj).map(
       ([encodedNode, timestamp]) => {
@@ -30,6 +36,18 @@ const Graph = () => {
 
     setSystems(newSystems);
   };
+
+  useEffect(() => {
+    if (notifications) {
+      setVisibleNotification(notifications);
+
+      const timer = setTimeout(() => {
+        setVisibleNotification(null);
+      }, 4000);
+
+      return () => clearTimeout(timer);
+    }
+  }, [notifications]);
 
   useEffect(() => {
     async function fetchGraph() {
@@ -193,7 +211,37 @@ const Graph = () => {
     <div className="app-container">
       <div className="top-header">
         <div className="header-page-title">Knowledge Graphs</div>
+        <div className="header-log-button">
+          {!isOpen && (
+            <button
+              className="view-logs-button"
+              onClick={() => setIsOpen(true)}
+            >
+              View Logs
+            </button>
+          )}
+        </div>
       </div>
+       {isOpen && (
+            <div className="overlay">
+              <button
+                className="close-button"
+                onClick={() => {
+                  setIsOpen(false);
+                }}
+              >
+                Close
+              </button>
+
+              <div className="log-container">
+                {logs.map((log, index) => (
+                  <div className="log-entry" key={index}>
+                    {log}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
       <div className="main-row">
         <div className="node-info-sidebar">
           <h2>Node Info</h2>
@@ -240,6 +288,12 @@ const Graph = () => {
           )}
         </div>
       </div>
+      {visibleNotification && (
+        <div className="notification-container">
+          <p>{visibleNotification}</p>
+        </div>
+      )}
+
       <div className="chat-container">
         <div className="chat-history">
           {messages.map((message, index) => (
