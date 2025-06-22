@@ -1,18 +1,153 @@
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, UploadFile, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 import os
+from contextlib import asynccontextmanager
 import shutil
 from agent import cypher_gen_chain
 from pydantic import BaseModel
 from agent_interface import AgentInterface
+from datetime import datetime
 import logging
+from apscheduler.schedulers.background import BackgroundScheduler
+from typing import Set 
+from file_manager import encode_file
+import asyncio 
+import json
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(filename='logs.log', encoding='utf-8', level=logging.INFO)
 
-app = FastAPI()
+scheduler = BackgroundScheduler()
+main_event_loop=None
+seen_files: Set[str] = set()
+connected_clients=set()
+
+async def async_broadcast_message(message: str):
+    disconnected = []
+    for client in connected_clients:
+        try:
+            await client.send_text(message)
+        except Exception as e:
+            disconnected.append(client)
+    
+    for client in disconnected:
+        connected_clients.remove(client)
+        
+def broadcast_message(message: str):
+    global main_event_loop
+    if main_event_loop:
+        asyncio.run_coroutine_threadsafe(
+            async_broadcast_message(message), main_event_loop
+        )
+
+async def stream_log_file():
+    """Stream log file content to connected WebSocket clients"""
+    import aiofiles
+    log_path = './ws.log'
+    
+    # Wait for log file to exist or create it
+    if not os.path.exists(log_path):
+        try:
+            with open(log_path, 'w') as f:
+                f.write("")  # Create empty log file
+            logger.info(f"Created log file: {log_path}")
+        except Exception as e:
+            logger.error(f"Failed to create log file: {e}")
+            return
+    
+    try:
+        # Get initial file size
+        last_size = os.path.getsize(log_path) if os.path.exists(log_path) else 0
+        logger.info(f"Started streaming log file from position: {last_size}")
+        
+        while True:
+            try:
+                current_size = os.path.getsize(log_path)
+                
+                # Check if file has grown
+                if current_size > last_size:
+                    async with aiofiles.open(log_path, mode='r') as f:
+                        # Seek to last known position
+                        await f.seek(last_size)
+                        
+                        # Read all new content
+                        new_content = await f.read()
+                        if new_content:
+                            # Split by lines and process each
+                            lines = new_content.split('\n')
+                            for line in lines:
+                                line = line.strip()
+                                if line:  # Only send non-empty lines
+                                    message = json.dumps({
+                                        'type': "log", 
+                                        "message": line,
+                                        "timestamp": datetime.now().isoformat()
+                                    })
+                                    if connected_clients:  # Only broadcast if there are clients
+                                        await async_broadcast_message(message)
+                                        logger.debug(f"Broadcasted log line: {line[:50]}...")
+                        
+                        # Update last known size
+                        last_size = current_size
+                
+                # Handle file truncation/rotation
+                elif current_size < last_size:
+                    logger.info("Log file was truncated, resetting position")
+                    last_size = 0
+                
+                await asyncio.sleep(0.5)  # Check every 500ms
+                
+            except FileNotFoundError:
+                logger.warning("Log file not found, waiting...")
+                await asyncio.sleep(1)
+                last_size = 0
+            except Exception as e:
+                logger.error(f"Error reading log file: {e}")
+                await asyncio.sleep(2)
+                
+    except asyncio.CancelledError:
+        logger.info("Log streaming task cancelled")
+        raise
+    except Exception as e:
+        logger.error(f"Critical error in stream_log_file: {e}")
+
+def check_for_new_files():
+    global seen_files
+    dr = 'uploads'
+    try:
+        current_files = set(os.listdir('uploads'))
+        new_files = current_files - seen_files
+        if new_files:
+            print(f"New files detected: {new_files}")
+            for f in new_files:
+                nf=encode_file(os.path.join(dr, f))
+                if nf:
+                    broadcast_message(json.dumps({"type":"notification", "message":f"New file: {nf}"})) 
+                seen_files.add(nf)
+    except Exception as e:
+        print(e)
+ 
+
+@asynccontextmanager
+async def lifespan(app:FastAPI):
+    global main_event_loop
+    main_event_loop = asyncio.get_running_loop()
+    scheduler.add_job(check_for_new_files, 'interval', seconds=20, id="file-manager")
+    log_streaming_task = asyncio.create_task(stream_log_file())
+    scheduler.start()
+    yield
+    if log_streaming_task:
+        log_streaming_task.cancel()
+    scheduler.shutdown() 
+    
+app = FastAPI(lifespan=lifespan)
 class Message(BaseModel):
     question:str
+    
+class UpdateSystemNode(BaseModel):
+    ip: str
+    name: str
+    timestamp: str
 
 origins = [
     "*"
@@ -30,16 +165,28 @@ app.add_middleware(
 async def root():
     return {"message": "Hello World"}
 
+@app.websocket("/ws")
+async def notification_endpoint(websocket:WebSocket):
+    await websocket.accept()
+    connected_clients.add(websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except Exception as e:
+        print(e)
+        
+
 @app.post("/upload")
 async def upload_metrics_file(file:UploadFile=File(...)):
     dir = 'uploads'
     if not os.path.exists(dir):
         os.makedirs(dir)
     file_location = os.path.join(dir, file.filename)
+
     try:
         with open(file_location, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-            AgentInterface().start_processing(file_location)
+            await AgentInterface().start_processing(file_location)
         return {'message': f"File {file.filename} was uploaded successfully"}
     except Exception as e:
         return {'error':f"File {file.filename} failed: {str(e)}"} 
@@ -50,11 +197,29 @@ async def test_question(data:Message):
     solution = cypher_gen_chain.invoke({'messages':[('user', data.question)]})
     return solution
 
-@app.post("/query-graph")
+@app.post("/query-graph") #TODO: fix error 429
 async def query_graph(query: Message):
-    return AgentInterface().query_graph(query.question)
-    
+    try:
+        response = await AgentInterface().query_graph(query.question)
+        return {"cypher_query":response['intermediate_steps'], "result":response['result']}
+    except Exception as _:
+        import asyncio
+        await asyncio.sleep(3)
+        response = await AgentInterface().query_graph(query.question)
+        return {"cypher_query":response['intermediate_steps'], "result":response['result']}
 
+@app.get('/get-node-ips')
+async def get_node_ips():
+    dr = './uploads'
+    node_ids = set()
+    node_data = {}
+    for f in os.listdir(dr):
+        node_id = f.split('_')[0]
+        node_timestamp = f.split('_')[2].split('.')[0] # get the timestamp
+        node_ids.add(node_id)
+        node_data[node_id] = node_timestamp
+    return node_data
+        
 @app.get('/get-current-graph')
 async def get_current_graph():
     records, summary, keys = AgentInterface().retrieve_current_graph()
@@ -74,7 +239,18 @@ async def get_current_graph():
 
     return graph_data
 
+@app.post('/start-update')
+async def start_update(node_to_update: UpdateSystemNode):
+    scheduler.pause_job("file-manager")
+    await AgentInterface().start_update(node_to_update.ip, node_to_update.name, node_to_update.timestamp)
+    scheduler.resume_job("file-manager")
+
 @app.get('/start-processing')
 async def start_processing():
     AgentInterface().start_processing()
     
+
+    
+    
+    
+#TODO change their name and create a synced task that checks if there are any updates
