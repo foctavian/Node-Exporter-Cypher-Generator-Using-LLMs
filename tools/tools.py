@@ -1,3 +1,4 @@
+import json
 from langchain.tools import tool
 from pydantic import BaseModel, Field
 from typing import Literal
@@ -23,10 +24,17 @@ def query_all_boards_telemetry() -> str:
     results = request_all_telemetry()
     if not results:
         return "No boards responded to discovery."
-    lines = []
-    for board_id, payload in results.items():
-        lines.append(f"Board {board_id}: {payload if payload is not None else 'no telemetry (timeout)'}")
-    return "\n".join(lines)
+    # Return a JSON array of the raw payloads so it stays machine-parseable
+    # downstream; boards that timed out are skipped.
+    payloads = []
+    for payload in results.values():
+        if payload is None:
+            continue
+        try:
+            payloads.append(json.loads(payload))
+        except (json.JSONDecodeError, TypeError):
+            continue
+    return json.dumps(payloads)
 
 @tool
 def query_espboard_telemetry(boardId: int) -> str:
