@@ -15,12 +15,8 @@ agent = create_agent(
 
 
 def ask(prompt: str) -> str:
-    """Run the agent on a natural-language request and return its final answer.
-    The agent decides when to call discover_boards / query_espboard_telemetry."""
     result = agent.invoke({"messages": [{"role": "user", "content": prompt}]})
     return result["messages"][-1].content
 
-
-if __name__ == "__main__":
-    print(ask("Give me the telemetry for all boards."))
-    # print(ask("Give me the telemetry for board 51"))
+def get_fetch_agent():
+    return agent
