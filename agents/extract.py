@@ -1,11 +1,3 @@
-"""Entity extraction from telemetry JSON (see agents/ARCHITECTURE.md).
-
-The LLM does the inference: given a board's semi-structured telemetry, it
-identifies the graph nodes (labels, identity keys, properties) and the
-relationships between them. No hand-coded structural rules — that is the point,
-so heterogeneous / previously-unseen board shapes are handled without code
-changes.
-"""
 import json
 from typing import cast
 from pydantic import BaseModel, Field
