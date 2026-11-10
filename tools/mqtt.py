@@ -2,8 +2,7 @@ import json
 from langchain.tools import tool
 from pydantic import BaseModel, Field
 from typing import Literal
-from ingest.mqtt_client import request_telemetry, discover, request_all_telemetry
-
+from ingest.mqtt_client import request_telemetry, discover, request_all_telemetry, sleep
 @tool
 def discover_boards() -> str:
     """
@@ -46,3 +45,11 @@ def query_espboard_telemetry(boardId: int) -> str:
     if result is None:
         return f"No telemetry from board {boardId} (timeout)"
     return result
+
+@tool 
+def sleep_board(boardId: int, timer: int):
+    """
+        Send the sleep command to the provided board ID
+    """
+    sleep(boardId, timer)
+    

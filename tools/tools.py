@@ -24,8 +24,6 @@ def query_all_boards_telemetry() -> str:
     results = request_all_telemetry()
     if not results:
         return "No boards responded to discovery."
-    # Return a JSON array of the raw payloads so it stays machine-parseable
-    # downstream; boards that timed out are skipped.
     payloads = []
     for payload in results.values():
         if payload is None:

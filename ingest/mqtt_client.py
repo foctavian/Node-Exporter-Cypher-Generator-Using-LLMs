@@ -128,8 +128,11 @@ def discover(window: float = 3.0) -> list[int]:
     return result
 
 def request_all_telemetry(window: float = 3.0, timeout: float = 5.0) -> dict[int, str | None]:
-    """Discover the live boards and fetch telemetry for each, entirely in
-    Python. Board ids come from discovery, never from the caller, so there are
-    no hallucinated ids. Returns {boardId: payload-or-None}."""
     boards = discover(window=window)
     return {board_id: request_telemetry(board_id, timeout=timeout) for board_id in boards}
+
+def sleep(boardId: int, timer: int):
+    global _client
+    if _client is not None:
+        _client.publish(f"mesh/cmd/sleep", json.dumps({"board_id": boardId, "timer": timer}))
+    
